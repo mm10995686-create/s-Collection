@@ -21,6 +21,7 @@ import tempfile
 import shutil
 import random
 import threading
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DEFAULT_THRESHOLD   = 0.7
@@ -294,6 +295,11 @@ def check_domain(host: str, verbose: bool, threshold: float,
                 driver.quit()
             except Exception:
                 pass
+        # driver.quit() 不能保证杀死所有 Chrome 子进程，用 temp_dir 精确兜底
+        try:
+            subprocess.run(["pkill", "-f", temp_dir], capture_output=True, timeout=5)
+        except Exception:
+            pass
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
