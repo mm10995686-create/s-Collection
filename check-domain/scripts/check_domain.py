@@ -9,6 +9,7 @@
   remove <域名...>    从监控列表删除域名
   list                查看当前监控列表
   run                 立即检测监控列表中所有域名（可由外部调度器定时触发）
+  sync <url>          从远程 JSON 拉取域名写入本地文件（供定时调度器调用）
   <域名...>           一次性检测指定域名（不影响监控列表）
 """
 
@@ -22,6 +23,7 @@ import shutil
 import random
 import threading
 import subprocess
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DEFAULT_THRESHOLD   = 0.7
@@ -29,6 +31,8 @@ DEFAULT_CONCURRENCY = 3
 MAX_CONCURRENCY     = 5
 WATCHLIST_PATH      = os.path.expanduser("~/.openclaw/data/check-domain/watchlist.json")
 LOG_PATH            = os.path.expanduser("~/.openclaw/data/check-domain/check.log")
+SYNCED_PATH         = os.path.expanduser("~/.openclaw/data/check-domain/synced_domains.txt")
+SYNC_META_PATH      = os.path.expanduser("~/.openclaw/data/check-domain/sync_meta.json")
 
 # Chrome 启动错峰：两次启动之间最少间隔（秒），加随机抖动
 LAUNCH_GAP_MIN    = 3.0
@@ -122,6 +126,96 @@ def _normalize_domain(host: str) -> str:
     if "://" in host:
         host = host.split("://", 1)[1]
     return host
+
+
+def _read_domains_from_file(path: str) -> list[str]:
+    """从文件读取域名列表，每行一个，忽略空行和 # 注释"""
+    if not os.path.exists(path):
+        print(f"❌ 文件不存在: {path}")
+        sys.exit(1)
+    domains = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                domains.append(line)
+    return domains
+
+
+# ──────────────────────────────────────────────
+# 远程 JSON 同步
+# ──────────────────────────────────────────────
+
+def _load_sync_meta() -> dict:
+    if not os.path.exists(SYNC_META_PATH):
+        return {}
+    try:
+        with open(SYNC_META_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_sync_meta(url: str, count: int):
+    _ensure_dir()
+    meta = {"url": url, "last_sync": time.strftime("%Y-%m-%d %H:%M:%S"), "count": count}
+    with open(SYNC_META_PATH, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+def cmd_sync(url: str, force: bool = False):
+    """
+    拉取远程 JSON，提取所有值（域名），去重后写入 SYNCED_PATH。
+    JSON 格式示例：{"{share.xxx}": "domain.cc", ...}
+    """
+    # 检查距上次同步是否未满 10 分钟（非强制模式）
+    if not force:
+        meta = _load_sync_meta()
+        if meta.get("url") == url:
+            last_ts = meta.get("last_sync", "")
+            try:
+                last_t = time.mktime(time.strptime(last_ts, "%Y-%m-%d %H:%M:%S"))
+                elapsed = time.time() - last_t
+                if elapsed < 600:
+                    remaining = int(600 - elapsed)
+                    print(f"⏭️  距上次同步仅 {int(elapsed)}s，跳过（还需 {remaining}s 后才满 10 分钟）")
+                    print(f"   上次: {last_ts}，共 {meta.get('count', 0)} 个域名")
+                    print(f"   使用 --force 强制重新拉取")
+                    return
+            except Exception:
+                pass
+
+    print(f"🌐 拉取远程配置: {url}")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read().decode("utf-8")
+    except Exception as e:
+        print(f"❌ 请求失败: {e}")
+        sys.exit(1)
+
+    try:
+        data = json.loads(content)
+    except Exception as e:
+        print(f"❌ JSON 解析失败: {e}")
+        sys.exit(1)
+
+    if not isinstance(data, dict):
+        print("❌ JSON 格式不符（期望顶层为对象）")
+        sys.exit(1)
+
+    # 提取所有值并归一化为域名
+    domains = sorted(set(_normalize_domain(v) for v in data.values() if isinstance(v, str) and v.strip()))
+
+    _ensure_dir()
+    with open(SYNCED_PATH, "w", encoding="utf-8") as f:
+        f.write(f"# 同步自: {url}\n")
+        f.write(f"# 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}  共 {len(domains)} 个域名\n")
+        for d in domains:
+            f.write(d + "\n")
+
+    _save_sync_meta(url, len(domains))
+    print(f"✅ 同步完成，共 {len(domains)} 个域名 → {SYNCED_PATH}")
 
 
 # ──────────────────────────────────────────────
@@ -395,7 +489,7 @@ def _append_log(results: list):
 # ──────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) >= 2 and sys.argv[1] in ("add", "remove", "list", "run"):
+    if len(sys.argv) >= 2 and sys.argv[1] in ("add", "remove", "list", "run", "sync"):
         subcmd = sys.argv[1]
 
         if subcmd == "list":
@@ -403,17 +497,51 @@ def main():
             return
 
         if subcmd == "add":
-            if len(sys.argv) < 3:
-                print("用法: check_domain.py add <域名1> [域名2] ...")
+            sub_parser = argparse.ArgumentParser()
+            sub_parser.add_argument("subcmd")
+            sub_parser.add_argument("domains", nargs="*")
+            sub_parser.add_argument("--file", "-f", help="从文件读取域名（每行一个）")
+            args = sub_parser.parse_args()
+            domains = list(args.domains)
+            if args.file:
+                domains += _read_domains_from_file(args.file)
+            if not domains:
+                print("用法: check_domain.py add <域名1> [域名2] ... [-f 文件路径]")
                 sys.exit(1)
-            cmd_add(sys.argv[2:])
+            cmd_add(domains)
             return
 
         if subcmd == "remove":
-            if len(sys.argv) < 3:
-                print("用法: check_domain.py remove <域名1> [域名2] ...")
+            sub_parser = argparse.ArgumentParser()
+            sub_parser.add_argument("subcmd")
+            sub_parser.add_argument("domains", nargs="*")
+            sub_parser.add_argument("--file", "-f", help="从文件读取域名（每行一个）")
+            args = sub_parser.parse_args()
+            domains = list(args.domains)
+            if args.file:
+                domains += _read_domains_from_file(args.file)
+            if not domains:
+                print("用法: check_domain.py remove <域名1> [域名2] ... [-f 文件路径]")
                 sys.exit(1)
-            cmd_remove(sys.argv[2:])
+            cmd_remove(domains)
+            return
+
+        if subcmd == "sync":
+            sub_parser = argparse.ArgumentParser()
+            sub_parser.add_argument("subcmd")
+            sub_parser.add_argument("url", nargs="?", help="远程 JSON 配置地址")
+            sub_parser.add_argument("--force", action="store_true", help="忽略 10 分钟冷却，强制重新拉取")
+            args = sub_parser.parse_args()
+            if not args.url:
+                # 尝试从上次元数据读取 url
+                meta = _load_sync_meta()
+                if meta.get("url"):
+                    args.url = meta["url"]
+                    print(f"ℹ️  使用上次同步地址: {args.url}")
+                else:
+                    print("用法: check_domain.py sync <url> [--force]")
+                    sys.exit(1)
+            cmd_sync(args.url, force=args.force)
             return
 
         if subcmd == "run":
@@ -424,10 +552,18 @@ def main():
             sub_parser.add_argument("--threshold",   type=float, default=DEFAULT_THRESHOLD)
             sub_parser.add_argument("--concurrency", "-c", type=int, default=DEFAULT_CONCURRENCY,
                                     help=f"并发数（默认 {DEFAULT_CONCURRENCY}，最大 {MAX_CONCURRENCY}）")
+            sub_parser.add_argument("--file", "-f", help="从文件读取域名（每行一个），覆盖监控列表")
+            sub_parser.add_argument("--synced", "-s", action="store_true",
+                                    help=f"使用 sync 拉取的本地缓存文件（{SYNCED_PATH}）")
             args = sub_parser.parse_args()
-            domains = load_watchlist()
+            if args.synced:
+                domains = _read_domains_from_file(SYNCED_PATH)
+            elif args.file:
+                domains = _read_domains_from_file(args.file)
+            else:
+                domains = load_watchlist()
             if not domains:
-                print("❌ 监控列表为空，请先用 `add <域名>` 添加域名")
+                print("❌ 监控列表为空，请先用 `add <域名>` 添加域名，或用 -f/-s 指定文件")
                 sys.exit(1)
             print(f"🕐 开始: {time.strftime('%Y-%m-%d %H:%M:%S')}")
             results = run_checks(domains, args.verbose, args.threshold, args.overseas, args.concurrency)
@@ -441,7 +577,8 @@ def main():
         description="域名封锁检测（via itdog.cn headless Chrome）",
         epilog="子命令: add / remove / list / run"
     )
-    parser.add_argument("domains",       nargs="+",  help="要检测的域名（一次性，不写入监控列表）")
+    parser.add_argument("domains",       nargs="*",  help="要检测的域名（一次性，不写入监控列表）")
+    parser.add_argument("--file",        "-f", help="从文件读取域名（每行一个），与直接传入的域名合并")
     parser.add_argument("--verbose",     "-v", action="store_true", help="显示各节点详情")
     parser.add_argument("--overseas",    "-o", action="store_true", help="包含港澳台、海外节点")
     parser.add_argument("--threshold",   type=float, default=DEFAULT_THRESHOLD, help="封锁判定阈值（默认 0.7）")
@@ -449,8 +586,15 @@ def main():
                         help=f"并发数（默认 {DEFAULT_CONCURRENCY}，最大 {MAX_CONCURRENCY}）")
     args = parser.parse_args()
 
+    domains = list(args.domains)
+    if args.file:
+        domains += _read_domains_from_file(args.file)
+    if not domains:
+        parser.print_help()
+        sys.exit(1)
+
     print(f"🕐 开始: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    results = run_checks(args.domains, args.verbose, args.threshold, args.overseas, args.concurrency)
+    results = run_checks(domains, args.verbose, args.threshold, args.overseas, args.concurrency)
     print_summary(results)
     print(f"\n🕐 完成: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     sys.exit(1 if any(r.get("blocked") for r in results) else 0)
