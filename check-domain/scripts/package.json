@@ -1,0 +1,16 @@
+{
+  "name": "check-domain",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "check": "npx ts-node check_domain.ts"
+  },
+  "dependencies": {
+    "playwright": "^1.44.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.4.0"
+  }
+}
