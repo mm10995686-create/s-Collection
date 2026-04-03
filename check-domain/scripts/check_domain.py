@@ -49,15 +49,37 @@ LAUNCH_GAP_JITTER = 2.0
 _print_lock       = threading.Lock()
 _launch_lock      = threading.Lock()
 _last_launch_time = 0.0
+_log_fh           = None  # 实时日志文件句柄，run 子命令时打开
+
+
+def _open_run_log():
+    """打开实时日志文件（run 子命令开始时调用）"""
+    global _log_fh
+    _ensure_dir()
+    _log_fh = open(LOG_PATH, "a", encoding="utf-8", buffering=1)  # 行缓冲，实时刷入
+    _log_fh.write(f"\n{'='*56}\n{time.strftime('%Y-%m-%d %H:%M:%S')} 开始检测\n{'='*56}\n")
+
+
+def _close_run_log():
+    """关闭实时日志文件"""
+    global _log_fh
+    if _log_fh:
+        _log_fh.write(f"{'='*56}\n{time.strftime('%Y-%m-%d %H:%M:%S')} 检测结束\n{'='*56}\n")
+        _log_fh.close()
+        _log_fh = None
 
 
 def _safe_print(msg: str, prefix: str = ""):
-    """线程安全的 print，并发模式下加域名前缀"""
+    """线程安全的 print，并发模式下加域名前缀；同步写入实时日志"""
+    ts = time.strftime("%H:%M:%S")
     with _print_lock:
         if prefix:
-            print(f"[{prefix}] {msg}")
+            line = f"[{prefix}] {msg}"
         else:
-            print(msg)
+            line = msg
+        print(line)
+        if _log_fh:
+            _log_fh.write(f"[{ts}] {line}\n")
 
 
 # ──────────────────────────────────────────────
@@ -417,6 +439,16 @@ def check_domain(host: str, verbose: bool, threshold: float,
         driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': hook_js})
         driver.get("https://www.itdog.cn/http/")
 
+        # itdog.cn 高流量时会显示「进入网站」验证按钮（id="access"），需点击后才出现检测表单
+        try:
+            access_btn = WebDriverWait(driver, 6).until(
+                EC.element_to_be_clickable((By.ID, "access"))
+            )
+            access_btn.click()
+            _safe_print("🔓 已点击「进入网站」验证按钮", display)
+        except Exception:
+            pass  # 无验证页，直接继续
+
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.ID, "host"))
         )
@@ -683,10 +715,9 @@ def print_summary(results: list):
 
 
 def _append_log(results: list):
-    _ensure_dir()
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(f"\n{'='*56}\n{ts}\n{'='*56}\n")
+    """将汇总结果追加到已打开的实时日志（或独立写入）"""
+    def _write(f):
+        f.write(f"{'─'*56}\n汇总结果\n{'─'*56}\n")
         for r in results:
             lab = _result_label(r)
             if r.get("error"):
@@ -697,6 +728,17 @@ def _append_log(results: list):
                 f.write(f"  BLOCKED {lab}  ({r['rate']*100:.1f}% {r['ok']}/{r['total']})\n")
             else:
                 f.write(f"  OK      {lab}  ({r['rate']*100:.1f}% {r['ok']}/{r['total']})\n")
+
+    if _log_fh:
+        # 实时日志已打开，直接追加
+        _write(_log_fh)
+    else:
+        # 兼容非 run 子命令的一次性检测
+        _ensure_dir()
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*56}\n{ts}\n{'='*56}\n")
+            _write(f)
 
 
 # ──────────────────────────────────────────────
@@ -822,20 +864,25 @@ def main():
             if not items:
                 print("❌ 监控列表为空，请先用 `add <域名>` 添加域名，或用 -f 指定文件")
                 sys.exit(1)
+            _open_run_log()
             print(f"🕐 开始: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            results = run_checks_batched(
-                items,
-                args.verbose,
-                args.threshold,
-                args.overseas,
-                args.concurrency,
-                progress_every=args.progress_every,
-                batch_size=args.batch_size,
-                batch_delay=args.batch_delay,
-            )
-            print_summary(results)
-            _append_log(results)
-            print(f"\n🕐 完成: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"📄 实时日志: {LOG_PATH}  （tail -f 可跟踪）")
+            try:
+                results = run_checks_batched(
+                    items,
+                    args.verbose,
+                    args.threshold,
+                    args.overseas,
+                    args.concurrency,
+                    progress_every=args.progress_every,
+                    batch_size=args.batch_size,
+                    batch_delay=args.batch_delay,
+                )
+                print_summary(results)
+                _append_log(results)
+                print(f"\n🕐 完成: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            finally:
+                _close_run_log()
             sys.exit(1 if any(r.get("blocked") for r in results) else 0)
 
     # 兼容旧用法：直接传域名参数（一次性检测）
