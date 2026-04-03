@@ -149,10 +149,32 @@ npx ts-node scripts/check_domain.ts extra.com -f domains.txt
 | `--threshold` | | 异常判定阈值，默认 `0.7` |
 | `--progress-every` | | `run` / 一次性检测：每完成 N 个域名打印进度（默认 `10`，`0` 关闭） |
 
+## 日志格式
+
+日志文件 `check.log` 实时追加，每完成一个域名立即写入一行，格式如下：
+
+```
+========================================================
+开始 2026-04-03 19:00:00，共 300 个域名
+========================================================
+  OK      [itdog] domain1  (100.0% 142/142)
+  BLOCKED [17ce] domain2  (28.0% 14/50)
+  ERROR   [chinaz] domain3: 检测超时
+  [进度] 2026-04-03 19:05:00  已完成 10/300，发现 1 个异常
+  ...
+========================================================
+完成 2026-04-03 19:30:00，共 300 个，异常 5 个
+========================================================
+```
+
+- 每条结果带 `[itdog]` / `[17ce]` / `[chinaz]` 平台标签
+- 每完成 10 个写一行带时间戳的进度行（stdout 同步输出）
+- OpenClaw 可通过 `tail -f check.log` 实时观察进度
+
 ## 文件路径
 
 - `~/.openclaw/data/check-domain/watchlist.json` — 监控列表
-- `~/.openclaw/data/check-domain/check.log` — 检测日志
+- `~/.openclaw/data/check-domain/check.log` — 检测日志（实时追加）
 - `~/.openclaw/data/check-domain/synced_map.json` — **sync 拉取的 key→域名映射**（`run --synced` 唯一数据源）
 - `~/.openclaw/data/check-domain/sync_meta.json` — sync 元信息（地址、时间、数量、分批大小）
 
@@ -165,16 +187,31 @@ npx ts-node scripts/check_domain.ts extra.com -f domains.txt
 
 ## 并发说明
 
-- **双平台分流**：workers 自动分配到 itdog.cn 和 17ce.com，避免单一平台限流
-  - `itdog workers = max(1, floor(N/2))`，`17ce workers = N - itdog workers`
-  - 例：`-c 4` → itdog×2 + 17ce×2；`-c 5` → itdog×2 + 17ce×3
-- **互相兜底**：任意平台初始化失败，另一方自动接管全部 workers，检测不中断
-- **单浏览器多 Page**：两个平台各一个 BrowserContext，共用同一 Chromium 进程
+- **三平台分流**：workers 自动分配到 itdog.cn、17ce.com、tool.chinaz.com，避免单一平台限流
+  - `itdog workers = max(1, floor(N/3))`，`17ce workers = floor((N - itdog)/2)`，`chinaz workers = 剩余`
+  - 例：`-c 3` → itdog×1 + 17ce×1 + chinaz×1；`-c 5` → itdog×1 + 17ce×2 + chinaz×2
+- **互相兜底**：任意平台初始化失败，其余平台自动均摊接管，检测不中断
+- **单浏览器多 Page**：三平台各一个 BrowserContext，共用同一 Chromium 进程
 - itdog.cn 的访问验证（高峰期「进入网站」按钮）只需过一次，Context 内 Cookie 共享
 - 17ce.com 只检测大陆节点（电信 / 联通 / 移动 / 铁通）
+- chinaz（tool.chinaz.com/speedtest）国内多节点测速，约 50 个节点；`code=2` 消息为检测结束标志
 - 单域名或 `-c 1` 只用 itdog
 
 ## 异常判定
 
 - 成功率 < 70% 提示可能存在访问异常
 - 退出码 `1` 表示存在异常节点（可用于 CI/定时巡检）
+
+## 对比 Python 旧版的优势
+
+| 维度 | Python 旧版 | 本版（TypeScript + Playwright） |
+|------|-------------|--------------------------------|
+| **检测平台** | 单一平台（itdog） | 三平台并发（itdog + 17ce + chinaz），互相兜底 |
+| **节点数量** | ~50 个节点 | 三平台合计可达 350+ 节点（itdog 142、17ce 150+、chinaz 50+） |
+| **并发模式** | 串行，一次一个域名 | 多 worker 并发，同时检测多个域名 |
+| **平台容错** | 平台挂掉则整批失败 | 任一平台初始化失败，其余自动接管，检测不中断 |
+| **日志** | 全部完成后一次性写入 | 每域名完成立即实时追加，带平台标签和进度行 |
+| **进度可观测** | 无 | 每 10 个域名打印进度（stdout + 日志），OpenClaw 可实时读取 |
+| **大批量分批** | 不支持 | `--batch-size` + `--batch-delay` 自动分批，避免平台限流 |
+| **配置中心集成** | 手动维护列表 | `sync <url>` 从远程 JSON 拉取，10 分钟冷却防重复，带 key 标注 |
+| **反检测** | 无 | 注入 WebSocket 代理拦截结果，`webdriver` 属性屏蔽 |

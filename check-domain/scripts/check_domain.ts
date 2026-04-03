@@ -45,6 +45,7 @@ interface NodeResult {
 interface CheckResult {
   host: string;
   shareKey: string | null;
+  platform?: Platform;
   blocked: boolean | null;
   rate?: number;
   ok?: number;
@@ -285,7 +286,7 @@ function readJobsFromFile(filePath: string): Job[] {
 
 // ── 核心检测 ────────────────────────────────────────────────────────────────
 
-type Platform = 'itdog' | '17ce';
+type Platform = 'itdog' | '17ce' | 'chinaz';
 
 // ── Hook 脚本（各平台独立，绑定 Context，每次导航自动重置） ─────────────────
 
@@ -306,6 +307,36 @@ const ITDOG_HOOK = /* js */ `
             });
           }
           if (d?.type === 'finished') window._itdog_finished = true;
+        } catch {}
+      });
+      return ws;
+    }
+  });
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+`;
+
+// tool.chinaz.com/speedtest：code=1 为节点结果，code=2 为检测结束标志
+const CHINAZ_HOOK = /* js */ `
+  window._chinaz_finished = false;
+  window._chinaz_nodes    = [];
+  const _OrigWS = window.WebSocket;
+  window.WebSocket = new Proxy(_OrigWS, {
+    construct(target, args) {
+      const ws = new target(...args);
+      ws.addEventListener('message', (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          // code=1：单节点结果，包含 address/ip/httpCode/timeTotal
+          if (d?.code === 1 && d?.address) {
+            window._chinaz_nodes.push({
+              name: d.address || '',
+              ip:   d.ip      || '',
+              http_code: d.httpCode  || 0,
+              time:      parseInt(d.timeTotal) || 0,
+            });
+          }
+          // code=2：全部节点检测完成
+          if (d?.code === 2) window._chinaz_finished = true;
         } catch {}
       });
       return ws;
@@ -429,6 +460,34 @@ async function check17ce(
   return await page.evaluate(() => (window as any)._17ce_nodes as NodeResult[]);
 }
 
+async function checkChinaz(
+  page: Page,
+  hostUrl: string,
+  display: string,
+): Promise<NodeResult[]> {
+  const log = (msg: string) => console.log(`[${display}] ${msg}`);
+
+  // 直接导航到结果页（无需手动提交表单）
+  const domain = hostUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  await page.goto(`https://tool.chinaz.com/speedtest/${domain}`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 30_000,
+  });
+  log('📡 检测节点: chinaz（国内测速）');
+  log('⏳ 等待检测完成...');
+
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    await sleep(5_000);
+    const finished = await page.evaluate(() => (window as any)._chinaz_finished as boolean);
+    const count    = await page.evaluate(() => ((window as any)._chinaz_nodes as unknown[]).length);
+    if (finished) { log(`✅ chinaz 完成，共 ${count} 个节点`); break; }
+    if (count)    log(`   已收到 ${count} 个节点，等待完成...`);
+  }
+
+  return await page.evaluate(() => (window as any)._chinaz_nodes as NodeResult[]);
+}
+
 /** 复用已有 page 检测一个域名，根据 platform 调用对应检测函数 */
 async function checkWithPage(
   page: Page,
@@ -448,8 +507,10 @@ async function checkWithPage(
   let nodes: NodeResult[];
   if (platform === 'itdog') {
     nodes = await checkItdog(page, hostUrl, overseas, display);
-  } else {
+  } else if (platform === '17ce') {
     nodes = await check17ce(page, hostUrl, display);
+  } else {
+    nodes = await checkChinaz(page, hostUrl, display);
   }
 
   if (verbose && nodes.length) {
@@ -465,7 +526,7 @@ async function checkWithPage(
   const rate    = total > 0 ? ok / total : 0;
   const blocked = total > 0 ? rate < threshold : null;
 
-  return { host, shareKey, blocked, rate, ok, total, nodes };
+  return { host, shareKey, platform, blocked, rate, ok, total, nodes };
 }
 
 // ── 并发执行（单浏览器双 Context，itdog + 17ce 各分配 workers） ──────────────
@@ -479,7 +540,9 @@ async function initContextPages(
   platform: Platform,
   count: number,
 ): Promise<Page[]> {
-  const hook = platform === 'itdog' ? ITDOG_HOOK : CE17_HOOK;
+  const hook = platform === 'itdog' ? ITDOG_HOOK
+             : platform === '17ce'  ? CE17_HOOK
+             : CHINAZ_HOOK;
   const ua   = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36';
 
   const ctx = await browser.newContext({ userAgent: ua, viewport: { width: 1920, height: 1080 } });
@@ -511,13 +574,23 @@ async function initContextPages(
     }
     return pages;
 
-  } else {
+  } else if (platform === '17ce') {
     // 17ce 无访问验证
     const pages: Page[] = [];
     for (let i = 0; i < count; i++) {
       const p = await ctx.newPage();
       await p.goto('http://17ce.com/', { waitUntil: 'domcontentloaded', timeout: 30_000 });
       await p.waitForSelector('#url', { timeout: 15_000 });
+      pages.push(p);
+    }
+    return pages;
+
+  } else {
+    // chinaz：直接导航到首页预热（每次检测时会跳转到结果页）
+    const pages: Page[] = [];
+    for (let i = 0; i < count; i++) {
+      const p = await ctx.newPage();
+      await p.goto('https://tool.chinaz.com/speedtest', { waitUntil: 'domcontentloaded', timeout: 30_000 });
       pages.push(p);
     }
     return pages;
@@ -537,14 +610,18 @@ async function runChecks(
   if (total === 0) return [];
 
   const actual      = Math.min(concurrency, MAX_CONCURRENCY, total);
-  const itdogCount  = Math.max(1, Math.floor(actual / 2));
-  const ce17Count   = actual - itdogCount;
+  // 三平台均分：itdog 占 1/3，17ce 占 1/3，chinaz 占剩余
+  const itdogCount  = Math.max(1, Math.floor(actual / 3));
+  const ce17Count   = Math.floor((actual - itdogCount) / 2);
+  const chinazCount = actual - itdogCount - ce17Count;
 
   if (total > 1) {
-    const desc = ce17Count > 0
-      ? `itdog×${itdogCount} + 17ce×${ce17Count}`
-      : `itdog×${itdogCount}`;
-    console.log(`📋 共 ${total} 个域名待检测\n⚡ Worker 池（${actual} 并发：${desc}）\n`);
+    const parts = [
+      `itdog×${itdogCount}`,
+      ce17Count   > 0 ? `17ce×${ce17Count}`     : '',
+      chinazCount > 0 ? `chinaz×${chinazCount}` : '',
+    ].filter(Boolean);
+    console.log(`📋 共 ${total} 个域名待检测\n⚡ Worker 池（${actual} 并发：${parts.join(' + ')}）\n`);
   }
 
   let browser: Browser | null = null;
@@ -554,17 +631,20 @@ async function runChecks(
       args: ['--no-proxy-server', '--no-sandbox', '--disable-dev-shm-usage'],
     });
 
-    // 两个平台串行初始化；任一失败则另一方接管全部 worker（互相兜底）
-    let itdogPages: Page[] = [];
-    let ce17Pages:  Page[] = [];
+    // 三平台串行初始化；任一失败由其余平台均摊兜底
+    let itdogPages:  Page[] = [];
+    let ce17Pages:   Page[] = [];
+    let chinazPages: Page[] = [];
 
     try {
       itdogPages = await initContextPages(browser, 'itdog', itdogCount);
     } catch (e) {
-      console.warn(`⚠️  [itdog] 初始化失败，将由 17ce 兜底：${String(e).split('\n')[0]}`);
+      console.warn(`⚠️  [itdog] 初始化失败，将由其他平台兜底：${String(e).split('\n')[0]}`);
     }
 
-    const ce17Needed = ce17Count + (itdogPages.length === 0 ? itdogCount : 0);
+    // 计算 17ce 需要承接的额外 worker 数
+    const itdogFailed = itdogPages.length === 0 ? itdogCount : 0;
+    const ce17Needed  = ce17Count + Math.ceil(itdogFailed / 2);
     if (ce17Needed > 0) {
       if (itdogPages.length > 0) await sleep(2_000);
       try {
@@ -574,24 +654,38 @@ async function runChecks(
       }
     }
 
-    if (itdogPages.length + ce17Pages.length === 0) {
+    // chinaz 承接剩余 worker
+    const ce17Failed    = ce17Pages.length === 0 ? ce17Needed : 0;
+    const chinazNeeded  = chinazCount + itdogFailed - Math.ceil(itdogFailed / 2) + ce17Failed;
+    if (chinazNeeded > 0) {
+      try {
+        chinazPages = await initContextPages(browser, 'chinaz', Math.min(chinazNeeded, MAX_CONCURRENCY));
+      } catch (e) {
+        console.warn(`⚠️  [chinaz] 初始化失败：${String(e).split('\n')[0]}`);
+      }
+    }
+
+    if (itdogPages.length + ce17Pages.length + chinazPages.length === 0) {
       throw new Error('所有检测平台均初始化失败，请稍后重试');
     }
 
     const allWorkers: Array<{ page: Page; platform: Platform }> = [
-      ...itdogPages.map(p => ({ page: p, platform: 'itdog' as Platform })),
-      ...ce17Pages.map(p  => ({ page: p, platform: '17ce'  as Platform })),
+      ...itdogPages.map(p  => ({ page: p, platform: 'itdog'  as Platform })),
+      ...ce17Pages.map(p   => ({ page: p, platform: '17ce'   as Platform })),
+      ...chinazPages.map(p => ({ page: p, platform: 'chinaz' as Platform })),
     ];
     const desc = [
-      itdogPages.length > 0 ? `itdog×${itdogPages.length}` : '',
-      ce17Pages.length  > 0 ? `17ce×${ce17Pages.length}`   : '',
+      itdogPages.length  > 0 ? `itdog×${itdogPages.length}`   : '',
+      ce17Pages.length   > 0 ? `17ce×${ce17Pages.length}`     : '',
+      chinazPages.length > 0 ? `chinaz×${chinazPages.length}` : '',
     ].filter(Boolean).join(' + ');
     console.log(`✅ ${allWorkers.length} 个 worker 就绪（${desc}）\n`);
 
     // 共享任务队列
     const queue: Array<[number, Job]> = jobs.map((job, idx) => [idx, job]);
     const results = new Array<CheckResult>(total);
-    let completed = 0;
+    let completed    = 0;
+    let blockedCount = 0;
 
     await Promise.all(
       allWorkers.map(async ({ page, platform }) => {
@@ -605,16 +699,21 @@ async function runChecks(
             console.error(`❌ [${jobLabel(key, d)}] 检测异常: ${e}`);
             results[idx] = { host: d, shareKey: key, blocked: null, error: String(e) };
           }
+          // 实时写单条结果
+          logOneResult(results[idx]);
+          if (results[idx].blocked) blockedCount++;
           completed++;
           if (progressEvery && completed % progressEvery === 0) {
-            console.log(`📍 进度: 已完成 ${completed}/${total}`);
+            const msg = `📍 进度: 已完成 ${completed}/${total}，发现 ${blockedCount} 个异常`;
+            console.log(msg);
+            logProgress(completed, total, blockedCount);
           }
         }
       }),
     );
 
     if (progressEvery && completed % progressEvery !== 0) {
-      console.log(`📍 进度: 已完成 ${total}/${total}`);
+      console.log(`📍 进度: 已完成 ${total}/${total}，发现 ${blockedCount} 个异常`);
     }
     return results;
 
@@ -669,15 +768,16 @@ function printSummary(results: CheckResult[]): string[] {
   const blockedList: string[] = [];
   for (const r of results) {
     const lab = resultLabel(r);
+    const tag = platformTag(r);
     if (r.error) {
-      console.log(`  ⚠️  ${lab} — 检测失败: ${r.error}`);
+      console.log(`  ⚠️  ${tag}${lab} — 检测失败: ${r.error}`);
     } else if (r.blocked === null) {
-      console.log(`  ⚠️  ${lab} — 无节点数据`);
+      console.log(`  ⚠️  ${tag}${lab} — 无节点数据`);
     } else if (r.blocked) {
-      console.log(`  🚫 ${lab} — 疑似被封  (成功率 ${((r.rate ?? 0) * 100).toFixed(1)}%，${r.ok}/${r.total} 节点)`);
+      console.log(`  🚫 ${tag}${lab} — 疑似被封  (成功率 ${((r.rate ?? 0) * 100).toFixed(1)}%，${r.ok}/${r.total} 节点)`);
       blockedList.push(lab);
     } else {
-      console.log(`  ✅ ${lab} — 正常访问  (成功率 ${((r.rate ?? 0) * 100).toFixed(1)}%，${r.ok}/${r.total} 节点)`);
+      console.log(`  ✅ ${tag}${lab} — 正常访问  (成功率 ${((r.rate ?? 0) * 100).toFixed(1)}%，${r.ok}/${r.total} 节点)`);
     }
   }
 
@@ -691,18 +791,40 @@ function printSummary(results: CheckResult[]): string[] {
   return blockedList;
 }
 
-function appendLog(results: CheckResult[]) {
+function platformTag(r: CheckResult): string {
+  return r.platform ? `[${r.platform}] ` : '';
+}
+
+function resultLogLine(r: CheckResult): string {
+  const lab = resultLabel(r);
+  const tag = platformTag(r);
+  if (r.error)               return `  ERROR   ${tag}${lab}: ${r.error}`;
+  if (r.blocked === null)    return `  NO_DATA ${tag}${lab}`;
+  if (r.blocked)             return `  BLOCKED ${tag}${lab}  (${((r.rate ?? 0) * 100).toFixed(1)}% ${r.ok}/${r.total})`;
+  return                            `  OK      ${tag}${lab}  (${((r.rate ?? 0) * 100).toFixed(1)}% ${r.ok}/${r.total})`;
+}
+
+function logOneResult(r: CheckResult) {
   ensureDir();
-  const sep   = '='.repeat(56);
-  const lines = [`\n${sep}`, fmtNow(), sep];
-  for (const r of results) {
-    const lab = resultLabel(r);
-    if (r.error)          lines.push(`  ERROR   ${lab}: ${r.error}`);
-    else if (r.blocked === null) lines.push(`  NO_DATA ${lab}`);
-    else if (r.blocked)   lines.push(`  BLOCKED ${lab}  (${((r.rate ?? 0) * 100).toFixed(1)}% ${r.ok}/${r.total})`);
-    else                  lines.push(`  OK      ${lab}  (${((r.rate ?? 0) * 100).toFixed(1)}% ${r.ok}/${r.total})`);
-  }
-  fs.appendFileSync(LOG_PATH, lines.join('\n') + '\n', 'utf-8');
+  fs.appendFileSync(LOG_PATH, resultLogLine(r) + '\n', 'utf-8');
+}
+
+function logProgress(completed: number, total: number, blockedCount: number) {
+  ensureDir();
+  const line = `  [进度] ${fmtNow()}  已完成 ${completed}/${total}，发现 ${blockedCount} 个异常`;
+  fs.appendFileSync(LOG_PATH, line + '\n', 'utf-8');
+}
+
+function logSessionStart(total: number) {
+  ensureDir();
+  const sep = '='.repeat(56);
+  fs.appendFileSync(LOG_PATH, `\n${sep}\n开始 ${fmtNow()}，共 ${total} 个域名\n${sep}\n`, 'utf-8');
+}
+
+function logSessionEnd(total: number, blockedCount: number) {
+  ensureDir();
+  const sep = '='.repeat(56);
+  fs.appendFileSync(LOG_PATH, `${sep}\n完成 ${fmtNow()}，共 ${total} 个，异常 ${blockedCount} 个\n${sep}\n`, 'utf-8');
 }
 
 // ── CLI 参数解析 ─────────────────────────────────────────────────────────────
@@ -819,13 +941,14 @@ async function main() {
     }
 
     console.log(`🕐 开始: ${fmtNow()}`);
+    logSessionStart(items.length);
     const results = await runChecksBatched(
       items, verbose, threshold, overseas, concurrency, progEvery, batchSize, batchDelay,
     );
-    printSummary(results);
-    appendLog(results);
+    const blocked = printSummary(results);
+    logSessionEnd(results.length, blocked.length);
     console.log(`\n🕐 完成: ${fmtNow()}`);
-    process.exit(results.some(r => r.blocked) ? 1 : 0);
+    process.exit(blocked.length > 0 ? 1 : 0);
   }
 
   // ── 一次性检测 ──
@@ -862,10 +985,12 @@ async function main() {
   }
 
   console.log(`🕐 开始: ${fmtNow()}`);
+  logSessionStart(items.length);
   const results = await runChecks(items, verbose, threshold, overseas, concurrency, progEvery);
-  printSummary(results);
+  const blocked = printSummary(results);
+  logSessionEnd(results.length, blocked.length);
   console.log(`\n🕐 完成: ${fmtNow()}`);
-  process.exit(results.some(r => r.blocked) ? 1 : 0);
+  process.exit(blocked.length > 0 ? 1 : 0);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
