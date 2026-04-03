@@ -1,3 +1,4 @@
+process.title = 'check-domain';
 import { chromium } from 'playwright';
 
 const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });

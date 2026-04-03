@@ -184,10 +184,14 @@ npx ts-node scripts/check_domain.ts extra.com -f domains.txt
 用户说"停止"、"取消"、"别查了"时，执行：
 
 ```bash
+# 停止主进程（check_domain.ts）
 pkill -f "check_domain.ts"
+
+# 停止所有 probe 子进程（probe.mjs 等，进程名均为 check-domain）
+pkill check-domain
 ```
 
-若进程已退出则忽略错误。停止后告知用户已完成的批次数和域名数（从 `check.log` 末尾读取）。
+两条都执行，若进程已退出则忽略错误。停止后告知用户已完成的批次数和域名数（从 `check.log` 末尾读取）。
 
 ## 定时巡检
 

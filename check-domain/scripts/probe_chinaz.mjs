@@ -2,6 +2,7 @@
  * 探针：分析 tool.chinaz.com/speedtest 的 WebSocket 协议
  * 运行: node probe_chinaz.mjs
  */
+process.title = 'check-domain';
 import { chromium } from 'playwright';
 
 const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
