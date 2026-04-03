@@ -1,6 +1,7 @@
 ---
 name: check-domain
-description: 通过第三方公开检测平台多节点验证域名在各地区的 HTTP 可达性。使用场景：(1) 检测自有域名在国内/海外的访问成功率，(2) 管理域名监控列表，(3) 定时巡检域名可用性，(4) 从远程 JSON 配置同步域名列表。触发词：/check-domain、检测域名、域名可达性
+description: 检测域名在国内各地区的 HTTP 可达性，支持监控列表管理、远程配置同步和定时巡检。触发场景：用户说"检测域名"、"域名可达性"、"/check-domain" 时使用。
+allowed-tools: Bash(npx:*) Bash(npm:*) Bash(pkill:*) Bash(pgrep:*)
 ---
 
 # 域名可达性检测
@@ -177,6 +178,16 @@ npx ts-node scripts/check_domain.ts extra.com -f domains.txt
 - `~/.openclaw/data/check-domain/check.log` — 检测日志（实时追加）
 - `~/.openclaw/data/check-domain/synced_map.json` — **sync 拉取的 key→域名映射**（`run --synced` 唯一数据源）
 - `~/.openclaw/data/check-domain/sync_meta.json` — sync 元信息（地址、时间、数量、分批大小）
+
+## 停止检测
+
+用户说"停止"、"取消"、"别查了"时，执行：
+
+```bash
+pkill -f "check_domain.ts"
+```
+
+若进程已退出则忽略错误。停止后告知用户已完成的批次数和域名数（从 `check.log` 末尾读取）。
 
 ## 定时巡检
 
