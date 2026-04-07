@@ -13,7 +13,7 @@
 将 `skills/` 目录下的技能文件夹复制到 OpenClaw 技能目录：
 
 ```bash
-cp -r skills/ ~/.openclaw/skills/
+cp -r ./check-domain ~/.openclaw/skills/check-domain
 ```
 
 ## 依赖
