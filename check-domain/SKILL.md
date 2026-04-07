@@ -154,7 +154,7 @@ npx ts-node scripts/check_domain.ts extra.com -f domains.txt
 | `--overseas` | `-o` | 包含港澳台、海外节点 |
 | `--threshold` | | 异常判定阈值，默认 `0.7` |
 | `--progress-every` | | `run` / 一次性检测：每完成 N 个域名打印进度（默认 `10`，`0` 关闭） |
-| `--platforms` | | 启用的检测平台，逗号分隔，默认 `itdog,17ce,chinaz`；如只用两个平台：`--platforms itdog,chinaz` |
+| `--platforms` | | 启用的检测平台，逗号分隔，默认 `itdog,chinaz`（17ce 不稳定默认关闭）；启用三平台：`--platforms itdog,17ce,chinaz` |
 
 ## 日志格式
 
@@ -210,8 +210,8 @@ pkill check-domain
 ## 并发说明
 
 - **平台可配置**：`--platforms itdog,chinaz` 只用指定平台，workers 按平台数均分
-  - 默认三平台：`-c 3` → itdog×1 + 17ce×1 + chinaz×1；`-c 5` → itdog×1 + 17ce×2 + chinaz×2
-  - 仅两平台：`--platforms itdog,chinaz -c 4` → itdog×2 + chinaz×2
+  - 默认两平台（itdog+chinaz）：`-c 2` → itdog×1 + chinaz×1；`-c 4` → itdog×2 + chinaz×2
+  - 启用三平台：`--platforms itdog,17ce,chinaz -c 3` → itdog×1 + 17ce×1 + chinaz×1
 - **互相兜底**：任意已启用平台初始化失败，其余已启用平台自动均摊接管，检测不中断
 - **单浏览器多 Page**：三平台各一个 BrowserContext，共用同一 Chromium 进程
 - itdog.cn 的访问验证（高峰期「进入网站」按钮）只需过一次，Context 内 Cookie 共享
