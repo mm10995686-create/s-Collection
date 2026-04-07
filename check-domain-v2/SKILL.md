@@ -86,6 +86,10 @@ npx ts-node scripts/check_domain.ts sync --force
 # 检测监控列表中所有域名
 npx ts-node scripts/check_domain.ts run
 
+# 进程中断后，从断点续跑（跳过日志中已完成的域名，ERROR 会重试）
+npx ts-node scripts/check_domain.ts run --resume
+npx ts-node scripts/check_domain.ts run --synced --resume
+
 # 检测 sync 拉取的远程配置域名（自动按 sync 时记录的批次大小分批）
 npx ts-node scripts/check_domain.ts run --synced
 
@@ -143,12 +147,14 @@ npx ts-node scripts/check_domain.ts extra.com -f domains.txt
 | `--synced` | `-s` | `run` 时使用 `synced_map.json`（须先 `sync`） |
 | `--force` | | `sync` 时忽略 10 分钟冷却强制重拉 |
 | `--batch-size` | `-B` | `sync`：记录分批大小；`run`：每批域名数（0 = 不分批）；`run --synced` 自动继承 sync 时的设定 |
+| `--resume` | `-r` | `run` 时跳过日志已完成域名，从断点续跑（ERROR 会重试） |
 | `--batch-delay` | | `run` 批次间等待秒数（默认 30s） |
 | `--concurrency` | `-c` | 并发数（默认 3，最大 5） |
 | `--verbose` | `-v` | 显示各节点 IP、HTTP 状态码 |
 | `--overseas` | `-o` | 包含港澳台、海外节点 |
 | `--threshold` | | 异常判定阈值，默认 `0.7` |
 | `--progress-every` | | `run` / 一次性检测：每完成 N 个域名打印进度（默认 `10`，`0` 关闭） |
+| `--platforms` | | 启用的检测平台，逗号分隔，默认 `itdog,17ce,chinaz`；如只用两个平台：`--platforms itdog,chinaz` |
 
 ## 日志格式
 
@@ -158,9 +164,9 @@ npx ts-node scripts/check_domain.ts extra.com -f domains.txt
 ========================================================
 开始 2026-04-03 19:00:00，共 300 个域名
 ========================================================
-  OK      [itdog] domain1  (100.0% 142/142)
-  BLOCKED [17ce] domain2  (28.0% 14/50)
-  ERROR   [chinaz] domain3: 检测超时
+  OK      [1/300] [itdog] domain5  (100.0% 142/142)
+  BLOCKED [2/300] [17ce] domain1  (28.0% 14/50)
+  ERROR   [3/300] [chinaz] domain3: 检测超时
   [进度] 2026-04-03 19:05:00  已完成 10/300，发现 1 个异常
   ...
 ========================================================
@@ -168,6 +174,7 @@ npx ts-node scripts/check_domain.ts extra.com -f domains.txt
 ========================================================
 ```
 
+- `[完成序号/总数]` 标注第几个完成（并发时按实际完成顺序递增，便于 OpenClaw 追踪进度）
 - 每条结果带 `[itdog]` / `[17ce]` / `[chinaz]` 平台标签
 - 每完成 10 个写一行带时间戳的进度行（stdout 同步输出）
 - OpenClaw 可通过 `tail -f check.log` 实时观察进度
@@ -202,10 +209,10 @@ pkill check-domain
 
 ## 并发说明
 
-- **三平台分流**：workers 自动分配到 itdog.cn、17ce.com、tool.chinaz.com，避免单一平台限流
-  - `itdog workers = max(1, floor(N/3))`，`17ce workers = floor((N - itdog)/2)`，`chinaz workers = 剩余`
-  - 例：`-c 3` → itdog×1 + 17ce×1 + chinaz×1；`-c 5` → itdog×1 + 17ce×2 + chinaz×2
-- **互相兜底**：任意平台初始化失败，其余平台自动均摊接管，检测不中断
+- **平台可配置**：`--platforms itdog,chinaz` 只用指定平台，workers 按平台数均分
+  - 默认三平台：`-c 3` → itdog×1 + 17ce×1 + chinaz×1；`-c 5` → itdog×1 + 17ce×2 + chinaz×2
+  - 仅两平台：`--platforms itdog,chinaz -c 4` → itdog×2 + chinaz×2
+- **互相兜底**：任意已启用平台初始化失败，其余已启用平台自动均摊接管，检测不中断
 - **单浏览器多 Page**：三平台各一个 BrowserContext，共用同一 Chromium 进程
 - itdog.cn 的访问验证（高峰期「进入网站」按钮）只需过一次，Context 内 Cookie 共享
 - 17ce.com 只检测大陆节点（电信 / 联通 / 移动 / 铁通）

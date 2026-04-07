@@ -597,6 +597,26 @@ async function initContextPages(
   }
 }
 
+const ALL_PLATFORMS: Platform[] = ['itdog', '17ce', 'chinaz'];
+// 17ce.com 不稳定，默认只启用 itdog + chinaz
+const DEFAULT_PLATFORMS: Platform[] = ['itdog', 'chinaz'];
+
+/** 解析 --platforms 参数，如 "itdog,chinaz"；无效平台名会报错退出 */
+function parsePlatforms(raw: string | undefined): Platform[] {
+  if (!raw) return [...DEFAULT_PLATFORMS];
+  const list = raw.split(',').map(s => s.trim()).filter(Boolean) as Platform[];
+  const invalid = list.filter(p => !ALL_PLATFORMS.includes(p));
+  if (invalid.length) {
+    console.error(`❌ 无效的平台名: ${invalid.join(', ')}（可选: itdog, 17ce, chinaz）`);
+    process.exit(1);
+  }
+  if (!list.length) {
+    console.error('❌ --platforms 不能为空');
+    process.exit(1);
+  }
+  return list;
+}
+
 async function runChecks(
   items: Array<string | Job>,
   verbose: boolean,
@@ -604,20 +624,44 @@ async function runChecks(
   overseas: boolean,
   concurrency: number,
   progressEvery = 10,
+  platforms: Platform[] = ALL_PLATFORMS,
+  resume = false,
 ): Promise<CheckResult[]> {
-  const jobs   = normalizeJobs(items);
-  const total  = jobs.length;
-  if (total === 0) return [];
+  let jobs   = normalizeJobs(items);
 
-  const actual      = Math.min(concurrency, MAX_CONCURRENCY, total);
-  // 三平台均分：itdog 占 1/3，17ce 占 1/3，chinaz 占剩余
-  const itdogCount  = Math.max(1, Math.floor(actual / 3));
-  const ce17Count   = Math.floor((actual - itdogCount) / 2);
-  const chinazCount = actual - itdogCount - ce17Count;
+  if (resume) {
+    const completed = loadCompletedHosts();
+    const before = jobs.length;
+    jobs = jobs.filter(([, host]) => !completed.has(host));
+    const skipped = before - jobs.length;
+    if (skipped > 0) {
+      console.log(`⏭️  续跑模式：已跳过 ${skipped} 个已完成域名，剩余 ${jobs.length} 个待检测`);
+    } else {
+      console.log(`ℹ️  续跑模式：日志中无已完成记录，将从头开始`);
+    }
+  }
+
+  const total  = jobs.length;
+  if (total === 0) { console.log('✅ 所有域名均已完成，无需重新检测'); return []; }
+
+  const actual = Math.min(concurrency, MAX_CONCURRENCY, total);
+  const n      = platforms.length;
+
+  // 按启用平台数均分 worker；itdog 始终优先（向上取整保证至少 1 个）
+  const counts: Partial<Record<Platform, number>> = {};
+  let remaining = actual;
+  platforms.forEach((p, i) => {
+    const allocated = i < n - 1 ? Math.max(1, Math.floor(remaining / (n - i))) : remaining;
+    counts[p] = allocated;
+    remaining -= allocated;
+  });
+  const itdogCount  = counts['itdog']  ?? 0;
+  const ce17Count   = counts['17ce']   ?? 0;
+  const chinazCount = counts['chinaz'] ?? 0;
 
   if (total > 1) {
     const parts = [
-      `itdog×${itdogCount}`,
+      itdogCount  > 0 ? `itdog×${itdogCount}`   : '',
       ce17Count   > 0 ? `17ce×${ce17Count}`     : '',
       chinazCount > 0 ? `chinaz×${chinazCount}` : '',
     ].filter(Boolean);
@@ -631,20 +675,23 @@ async function runChecks(
       args: ['--no-proxy-server', '--no-sandbox', '--disable-dev-shm-usage'],
     });
 
-    // 三平台串行初始化；任一失败由其余平台均摊兜底
+    // 各平台串行初始化；任一失败，其 worker 按比例分给其余已启用平台
     let itdogPages:  Page[] = [];
     let ce17Pages:   Page[] = [];
     let chinazPages: Page[] = [];
 
-    try {
-      itdogPages = await initContextPages(browser, 'itdog', itdogCount);
-    } catch (e) {
-      console.warn(`⚠️  [itdog] 初始化失败，将由其他平台兜底：${String(e).split('\n')[0]}`);
+    if (itdogCount > 0) {
+      try {
+        itdogPages = await initContextPages(browser, 'itdog', itdogCount);
+      } catch (e) {
+        console.warn(`⚠️  [itdog] 初始化失败，将由其他平台兜底：${String(e).split('\n')[0]}`);
+      }
     }
 
-    // 计算 17ce 需要承接的额外 worker 数
     const itdogFailed = itdogPages.length === 0 ? itdogCount : 0;
-    const ce17Needed  = ce17Count + Math.ceil(itdogFailed / 2);
+    // 17ce 兜底：仅在 17ce 已启用时承接 itdog 失败的一半 worker
+    const ce17Extra  = platforms.includes('17ce') ? Math.ceil(itdogFailed / 2) : 0;
+    const ce17Needed = ce17Count + ce17Extra;
     if (ce17Needed > 0) {
       if (itdogPages.length > 0) await sleep(2_000);
       try {
@@ -654,9 +701,10 @@ async function runChecks(
       }
     }
 
-    // chinaz 承接剩余 worker
-    const ce17Failed    = ce17Pages.length === 0 ? ce17Needed : 0;
-    const chinazNeeded  = chinazCount + itdogFailed - Math.ceil(itdogFailed / 2) + ce17Failed;
+    // chinaz 承接剩余失败 worker（仅在 chinaz 已启用时）
+    const ce17Failed   = ce17Pages.length === 0 ? ce17Needed : 0;
+    const chinazExtra  = platforms.includes('chinaz') ? (itdogFailed - ce17Extra + ce17Failed) : 0;
+    const chinazNeeded = chinazCount + chinazExtra;
     if (chinazNeeded > 0) {
       try {
         chinazPages = await initContextPages(browser, 'chinaz', Math.min(chinazNeeded, MAX_CONCURRENCY));
@@ -700,7 +748,7 @@ async function runChecks(
             results[idx] = { host: d, shareKey: key, blocked: null, error: String(e) };
           }
           // 实时写单条结果
-          logOneResult(results[idx]);
+          logOneResult(results[idx], completed + 1, total);
           if (results[idx].blocked) blockedCount++;
           completed++;
           if (progressEvery && completed % progressEvery === 0) {
@@ -731,12 +779,28 @@ async function runChecksBatched(
   progressEvery = 10,
   batchSize = 0,
   batchDelay = 30,
+  platforms: Platform[] = ALL_PLATFORMS,
+  resume = false,
 ): Promise<CheckResult[]> {
-  const jobs  = normalizeJobs(items);
+  // 续跑：在分批前先过滤已完成域名（整体过滤一次，避免重复读日志）
+  let jobs = normalizeJobs(items);
+  if (resume) {
+    const completed = loadCompletedHosts();
+    const before = jobs.length;
+    jobs = jobs.filter(([, host]) => !completed.has(host));
+    const skipped = before - jobs.length;
+    if (skipped > 0) {
+      console.log(`⏭️  续跑模式：已跳过 ${skipped} 个已完成域名，剩余 ${jobs.length} 个待检测`);
+    } else {
+      console.log(`ℹ️  续跑模式：日志中无已完成记录，将从头开始`);
+    }
+  }
+
   const total = jobs.length;
+  if (total === 0) { console.log('✅ 所有域名均已完成，无需重新检测'); return []; }
 
   if (batchSize <= 0 || total <= batchSize) {
-    return runChecks(jobs, verbose, threshold, overseas, concurrency, progressEvery);
+    return runChecks(jobs, verbose, threshold, overseas, concurrency, progressEvery, platforms);
   }
 
   const batches: Job[][] = [];
@@ -748,7 +812,7 @@ async function runChecksBatched(
     console.log(`\n${'─'.repeat(48)}`);
     console.log(`📦 第 ${i + 1}/${batches.length} 批，共 ${batches[i].length} 个域名`);
     console.log('─'.repeat(48));
-    const results = await runChecks(batches[i], verbose, threshold, overseas, concurrency, progressEvery);
+    const results = await runChecks(batches[i], verbose, threshold, overseas, concurrency, progressEvery, platforms);
     allResults.push(...results);
     if (i < batches.length - 1) {
       console.log(`\n⏸️  批次间隔 ${batchDelay}s，等待中...`);
@@ -756,6 +820,54 @@ async function runChecksBatched(
     }
   }
   return allResults;
+}
+
+// ── 断点续跑：从日志读取已完成域名 ──────────────────────────────────────────
+
+/**
+ * 解析 check.log，返回最后一次**被中断** session 中已完成的域名集合。
+ *
+ * 判断逻辑：
+ *   1. 找到最后一个「开始」标记行的位置
+ *   2. 若其后存在「完成」标记，说明上次正常结束，无需续跑 → 返回空集合并打印提示
+ *   3. 若其后无「完成」标记，说明进程被中断 → 只读该「开始」之后的 OK/BLOCKED/NO_DATA 行
+ *
+ * ERROR 行不计入，下次会重试。
+ */
+function loadCompletedHosts(): Set<string> {
+  const completed = new Set<string>();
+  if (!fs.existsSync(LOG_PATH)) return completed;
+  const lines = fs.readFileSync(LOG_PATH, 'utf-8').split('\n');
+
+  // 找最后一个「开始」行的索引
+  const startRe  = /^开始\s/;
+  const finishRe = /^完成\s/;
+  let lastStartIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (startRe.test(lines[i].trim())) lastStartIdx = i;
+  }
+
+  if (lastStartIdx === -1) return completed; // 日志里没有任何 session
+
+  // 检查该「开始」之后是否存在「完成」
+  const hasFinish = lines.slice(lastStartIdx + 1).some(l => finishRe.test(l.trim()));
+  if (hasFinish) {
+    console.log('ℹ️  续跑模式：上次 session 已正常完成，无中断记录，将从头开始');
+    return completed;
+  }
+
+  // 只读中断 session（lastStartIdx 之后）的完成记录
+  const re = /^\s+(?:OK|BLOCKED|NO_DATA)\s+\[\d+\/\d+\]\s+\[\w+\]\s+(.+?)(?:\s{2,}|$)/;
+  for (let i = lastStartIdx + 1; i < lines.length; i++) {
+    const m = re.exec(lines[i]);
+    if (!m) continue;
+    let label = m[1].trim();
+    // 若含 shareKey："{share.xxx} → host"，取 → 后面的 host
+    const arrowIdx = label.lastIndexOf(' → ');
+    if (arrowIdx !== -1) label = label.slice(arrowIdx + 3).trim();
+    if (label) completed.add(label);
+  }
+  return completed;
 }
 
 // ── 输出 & 日志 ────────────────────────────────────────────────────────────
@@ -795,18 +907,19 @@ function platformTag(r: CheckResult): string {
   return r.platform ? `[${r.platform}] ` : '';
 }
 
-function resultLogLine(r: CheckResult): string {
-  const lab = resultLabel(r);
-  const tag = platformTag(r);
-  if (r.error)               return `  ERROR   ${tag}${lab}: ${r.error}`;
-  if (r.blocked === null)    return `  NO_DATA ${tag}${lab}`;
-  if (r.blocked)             return `  BLOCKED ${tag}${lab}  (${((r.rate ?? 0) * 100).toFixed(1)}% ${r.ok}/${r.total})`;
-  return                            `  OK      ${tag}${lab}  (${((r.rate ?? 0) * 100).toFixed(1)}% ${r.ok}/${r.total})`;
+function resultLogLine(r: CheckResult, seq?: number, total?: number): string {
+  const lab     = resultLabel(r);
+  const tag     = platformTag(r);
+  const seqTag  = seq != null && total != null ? `[${seq}/${total}] ` : '';
+  if (r.error)               return `  ERROR   ${seqTag}${tag}${lab}: ${r.error}`;
+  if (r.blocked === null)    return `  NO_DATA ${seqTag}${tag}${lab}`;
+  if (r.blocked)             return `  BLOCKED ${seqTag}${tag}${lab}  (${((r.rate ?? 0) * 100).toFixed(1)}% ${r.ok}/${r.total})`;
+  return                            `  OK      ${seqTag}${tag}${lab}  (${((r.rate ?? 0) * 100).toFixed(1)}% ${r.ok}/${r.total})`;
 }
 
-function logOneResult(r: CheckResult) {
+function logOneResult(r: CheckResult, seq?: number, total?: number) {
   ensureDir();
-  fs.appendFileSync(LOG_PATH, resultLogLine(r) + '\n', 'utf-8');
+  fs.appendFileSync(LOG_PATH, resultLogLine(r, seq, total) + '\n', 'utf-8');
 }
 
 function logProgress(completed: number, total: number, blockedCount: number) {
@@ -910,12 +1023,14 @@ async function main() {
     const verbose     = flagBool(rawArgs, '--verbose', '-v');
     const overseas    = flagBool(rawArgs, '--overseas', '-o');
     const synced      = flagBool(rawArgs, '--synced', '-s');
+    const resume      = flagBool(rawArgs, '--resume', '-r');
     const file        = flagValue(rawArgs, '--file', '-f');
     const threshold   = floatOr(flagValue(rawArgs, '--threshold'), DEFAULT_THRESHOLD);
     const concurrency = intOr(flagValue(rawArgs, '--concurrency', '-c'), DEFAULT_CONCURRENCY);
     const progEvery   = intOr(flagValue(rawArgs, '--progress-every'), 10);
     let   batchSize   = intOr(flagValue(rawArgs, '--batch-size', '-B'), 0);
     const batchDelay  = floatOr(flagValue(rawArgs, '--batch-delay'), 30);
+    const platforms   = parsePlatforms(flagValue(rawArgs, '--platforms'));
 
     let items: Job[] = [];
     if (synced) {
@@ -943,7 +1058,7 @@ async function main() {
     console.log(`🕐 开始: ${fmtNow()}`);
     logSessionStart(items.length);
     const results = await runChecksBatched(
-      items, verbose, threshold, overseas, concurrency, progEvery, batchSize, batchDelay,
+      items, verbose, threshold, overseas, concurrency, progEvery, batchSize, batchDelay, platforms, resume,
     );
     const blocked = printSummary(results);
     logSessionEnd(results.length, blocked.length);
@@ -952,13 +1067,14 @@ async function main() {
   }
 
   // ── 一次性检测 ──
-  const valuedFlagNames = ['--threshold', '--concurrency', '-c', '--progress-every', '--file', '-f'];
+  const valuedFlagNames = ['--threshold', '--concurrency', '-c', '--progress-every', '--file', '-f', '--platforms'];
   const file        = flagValue(rawArgs, '--file', '-f');
   const verbose     = flagBool(rawArgs, '--verbose', '-v');
   const overseas    = flagBool(rawArgs, '--overseas', '-o');
   const threshold   = floatOr(flagValue(rawArgs, '--threshold'), DEFAULT_THRESHOLD);
   const concurrency = intOr(flagValue(rawArgs, '--concurrency', '-c'), DEFAULT_CONCURRENCY);
   const progEvery   = intOr(flagValue(rawArgs, '--progress-every'), 10);
+  const platforms   = parsePlatforms(flagValue(rawArgs, '--platforms'));
 
   const items: Job[] = posArgs(rawArgs, valuedFlagNames).map(d => [null, normalizeDomain(d)]);
   if (file) items.push(...readJobsFromFile(file));
@@ -975,18 +1091,20 @@ async function main() {
   npx ts-node check_domain.ts run               检测监控列表
 
 选项:
-  -v, --verbose           显示各节点详情
-  -o, --overseas          包含港澳台、海外节点
-  --threshold <N>         封锁判定阈值（默认 0.7）
-  -c, --concurrency <N>   并发数（默认 3，最大 5）
-  -f, --file <文件>       从文件读取域名
-  --progress-every <N>    每完成 N 个打印进度（默认 10）`);
+  -v, --verbose              显示各节点详情
+  -o, --overseas             包含港澳台、海外节点
+  --threshold <N>            封锁判定阈值（默认 0.7）
+  -c, --concurrency <N>      并发数（默认 3，最大 5）
+  -f, --file <文件>          从文件读取域名
+  --progress-every <N>       每完成 N 个打印进度（默认 10）
+  --platforms <平台列表>     启用的检测平台，逗号分隔（默认 itdog,chinaz；17ce 不稳定默认关闭）
+                             示例: --platforms itdog,17ce,chinaz`);
     process.exit(1);
   }
 
   console.log(`🕐 开始: ${fmtNow()}`);
   logSessionStart(items.length);
-  const results = await runChecks(items, verbose, threshold, overseas, concurrency, progEvery);
+  const results = await runChecks(items, verbose, threshold, overseas, concurrency, progEvery, platforms);
   const blocked = printSummary(results);
   logSessionEnd(results.length, blocked.length);
   console.log(`\n🕐 完成: ${fmtNow()}`);
