@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 highlight_clip.py — 高光时刻自动剪辑
-通过帧间运动量检测 + 可选 LLaVA 语义评分，识别并剪辑出最精彩的片段
+通过帧间运动量检测 + 可选 CLIP 语义评分，识别并剪辑出最精彩的片段
 
 评分策略（--mode 控制）：
   motion  : 帧间像素差（默认，最快，无内容限制）
-  llava   : LLaVA 语义评分（需要 Ollama，慢但理解内容）
-  hybrid  : 运动量 * 0.6 + LLaVA * 0.4（兼顾两者）
+  clip    : CLIP 语义评分（CPU 即可，快速且区分度好）
+  hybrid  : 运动量 * 0.6 + CLIP * 0.4（兼顾两者）
 
 数据目录：~/.openclaw/data/highlight-clip/<session-id>/
 """
@@ -19,8 +19,11 @@ import subprocess
 import shutil
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.request import urlopen, Request
+from urllib.parse import urljoin
+from urllib.error import URLError, HTTPError
 import time
 import re
 
@@ -63,7 +66,18 @@ def check_dependencies(args: argparse.Namespace) -> None:
             print(f'❌ 未找到 {bin_}，请先安装：brew install ffmpeg')
             sys.exit(1)
 
-    if args.mode in ('llava', 'hybrid'):
+    if args.mode in ('clip', 'hybrid'):
+        try:
+            import open_clip  # noqa: F401
+            print(f'✅ 依赖检查通过（CLIP 模型: {args.clip_model}，模式: {args.mode}）')
+        except ImportError:
+            print('❌ 未安装 open_clip_torch，请运行：pip3 install open_clip_torch')
+            sys.exit(1)
+    else:
+        print(f'✅ 依赖检查通过（模式: motion，纯本地运算）')
+
+    # --describe 需要 Ollama
+    if args.describe:
         try:
             import ollama as _ollama
             client = _ollama.Client(host=OLLAMA_HOST)
@@ -73,12 +87,10 @@ def check_dependencies(args: argparse.Namespace) -> None:
                 print(f'❌ 模型 {args.model} 未下载，请运行：ollama pull {args.model}')
                 print(f'   已有模型：{", ".join(names) or "（无）"}')
                 sys.exit(1)
-            print(f'✅ 依赖检查通过（模型: {args.model}，模式: {args.mode}）')
+            print(f'✅ LLaVA 描述模型就绪（{args.model}）')
         except Exception as e:
             print(f'❌ 无法连接 Ollama（{OLLAMA_HOST}）：{e}')
             sys.exit(1)
-    else:
-        print(f'✅ 依赖检查通过（模式: motion，纯本地运算）')
 
 # ──────────────────────────────────────────────────────────────
 # 1. 获取视频时长
@@ -98,6 +110,157 @@ def get_video_duration(url: str) -> float:
         pass
     print('   ⚠️  无法获取时长，最多采集 max-frames 帧')
     return 0.0
+
+# ──────────────────────────────────────────────────────────────
+# 1.5 M3U8 并发下载
+# ──────────────────────────────────────────────────────────────
+
+def _fetch_text(url: str, timeout: int = 15) -> str:
+    """下载文本内容"""
+    req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode('utf-8', errors='replace')
+
+def parse_m3u8(url: str) -> Tuple[List[str], float]:
+    """
+    解析 M3U8 播放列表，返回 (分片 URL 列表, 总时长秒数)。
+    自动处理 master playlist → 选最高带宽的 variant。
+    """
+    text = _fetch_text(url)
+    lines = text.strip().splitlines()
+
+    # master playlist：含 #EXT-X-STREAM-INF，需要选 variant
+    if any('#EXT-X-STREAM-INF' in l for l in lines):
+        best_bw = -1
+        best_uri = None
+        for i, line in enumerate(lines):
+            if '#EXT-X-STREAM-INF' in line:
+                # 提取 BANDWIDTH
+                m = re.search(r'BANDWIDTH=(\d+)', line)
+                bw = int(m.group(1)) if m else 0
+                # 下一行是 URI
+                if i + 1 < len(lines) and not lines[i + 1].startswith('#'):
+                    if bw > best_bw:
+                        best_bw = bw
+                        best_uri = lines[i + 1].strip()
+        if best_uri:
+            variant_url = urljoin(url, best_uri)
+            print(f'   📡 Master playlist → 选择最高画质（带宽: {best_bw}）')
+            return parse_m3u8(variant_url)
+
+    # media playlist：解析分片
+    segments = []
+    total_duration = 0.0
+    for i, line in enumerate(lines):
+        if line.startswith('#EXTINF:'):
+            # 提取时长
+            m = re.search(r'#EXTINF:([\d.]+)', line)
+            if m:
+                total_duration += float(m.group(1))
+            # 下一个非注释行是分片 URL
+            for j in range(i + 1, len(lines)):
+                if lines[j].strip() and not lines[j].startswith('#'):
+                    seg_url = urljoin(url, lines[j].strip())
+                    segments.append(seg_url)
+                    break
+
+    return segments, total_duration
+
+def _download_segment(args_tuple: tuple) -> Tuple[int, bool, str]:
+    """下载单个分片，失败重试 3 次"""
+    idx, seg_url, output_path, retries = args_tuple
+    for attempt in range(retries + 1):
+        try:
+            req = Request(seg_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urlopen(req, timeout=30) as resp:
+                data = resp.read()
+            Path(output_path).write_bytes(data)
+            return idx, True, ''
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            return idx, False, str(e)
+
+def download_m3u8(url: str, session_dir: Path, concurrency: int = 16,
+                  verbose: bool = False) -> Optional[str]:
+    """
+    并发下载 M3U8 分片，合并为本地 video.ts。
+    如果 URL 不是 M3U8 返回 None（由调用方继续用原始 URL）。
+    """
+    # 判断是否为 M3U8
+    is_m3u8 = '.m3u8' in url.split('?')[0].lower()
+    if not is_m3u8:
+        try:
+            req = Request(url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
+            with urlopen(req, timeout=10) as resp:
+                ct = resp.headers.get('Content-Type', '')
+                is_m3u8 = 'mpegurl' in ct.lower()
+        except Exception:
+            pass
+    if not is_m3u8:
+        return None
+
+    print(f'\n📥 解析 M3U8 播放列表...')
+    try:
+        segments, m3u8_duration = parse_m3u8(url)
+    except Exception as e:
+        print(f'   ⚠️  M3U8 解析失败（{e}），回退到 ffmpeg 直接读取')
+        return None
+
+    if not segments:
+        print(f'   ⚠️  未解析到分片，回退到 ffmpeg 直接读取')
+        return None
+
+    total = len(segments)
+    print(f'   共 {total} 个分片（约 {fmt_time(m3u8_duration)}），并发 {concurrency} 下载...')
+
+    # 临时目录存放分片
+    seg_dir = session_dir / '_segments'
+    seg_dir.mkdir(parents=True, exist_ok=True)
+
+    # 构建下载任务
+    tasks = []
+    for i, seg_url in enumerate(segments):
+        seg_path = str(seg_dir / f'seg_{i:05d}.ts')
+        tasks.append((i, seg_url, seg_path, 3))
+
+    # 并发下载
+    completed = 0
+    failed = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = {ex.submit(_download_segment, t): t for t in tasks}
+        for fut in as_completed(futures):
+            idx, ok, err = fut.result()
+            completed += 1
+            if not ok:
+                failed += 1
+                if verbose:
+                    print(f'\n   ❌ 分片 {idx} 下载失败：{err}')
+            print(f'\r   [{progress_bar(completed, total)}] {completed}/{total}'
+                  f'{f"  ({failed} 失败)" if failed else ""}',
+                  end='', flush=True)
+    print()
+
+    if failed > total * 0.1:
+        print(f'   ⚠️  失败率过高（{failed}/{total}），回退到 ffmpeg 直接读取')
+        shutil.rmtree(seg_dir, ignore_errors=True)
+        return None
+
+    # 按序号合并分片为 video.ts
+    output_path = session_dir / 'video.ts'
+    print(f'   🔗 合并分片...', end='', flush=True)
+    seg_files = sorted(seg_dir.glob('seg_*.ts'))
+    with open(output_path, 'wb') as out:
+        for sf in seg_files:
+            out.write(sf.read_bytes())
+    print(f' ✅ {output_path.stat().st_size / 1024 / 1024:.1f} MB')
+
+    # 清理临时分片
+    shutil.rmtree(seg_dir, ignore_errors=True)
+
+    print(f'   ✅ 下载完成：{output_path}')
+    return str(output_path)
 
 # ──────────────────────────────────────────────────────────────
 # 2. 提取视频帧
@@ -182,81 +345,126 @@ def compute_motion_scores(frames: List[Dict]) -> List[Dict]:
     return results
 
 # ──────────────────────────────────────────────────────────────
-# 3b. LLaVA 语义评分
+# 3b. CLIP 语义评分
 # ──────────────────────────────────────────────────────────────
 
 LLAVA_DESC_PROMPT = "用一句话（15字以内）描述这张视频截图的画面内容，只说看到的画面，不要评价好坏。只返回描述文字，不要其他内容。"
 
-LLAVA_PROMPT = """这是一段视频的截图。请评估这一帧画面的"精彩程度"（0-100分）。
-评分标准（严格区分，大多数普通画面应在 30-50 分）：
-  0-20:  画面静止，单人无动作，无特别之处
-  20-40: 轻微动作或变化
-  40-60: 中等强度，有明显动作或情绪
-  60-80: 高强度动作，激烈运动或强烈情绪
-  80-100: 极度激烈的高潮时刻
+# CLIP 参考文本锚点（可通过 scripts/clip_texts.json 自定义）
+_DEFAULT_LOW_TEXTS = [
+    "a still static frame with no movement",
+    "a calm quiet scene with nothing happening",
+    "a boring static image",
+]
+_DEFAULT_HIGH_TEXTS = [
+    "an exciting intense moment with strong action",
+    "a dramatic climax with vigorous movement",
+    "a thrilling highlight with peak intensity",
+]
 
-只返回 JSON，不要其他内容：{"score":45,"desc":"一句话描述"}"""
-
-def analyze_frame_llava(frame: Dict, model: str, retries: int = 2) -> Dict:
-    import ollama as _ollama
-    client = _ollama.Client(host=OLLAMA_HOST)
-
-    # 缩小图片减少处理时间
-    img = Image.open(frame['path'])
-    w, h = img.size
-    if w > 768:
-        img = img.resize((768, int(h * 768 / w)), Image.LANCZOS)
-    tmp = frame['path'].replace('.jpg', '_s.jpg')
-    img.save(tmp, 'JPEG', quality=80)
-
-    for attempt in range(retries + 1):
+def _load_clip_texts() -> tuple:
+    """从 clip_texts.json 加载自定义文本，找不到则用默认值"""
+    cfg_path = Path(__file__).parent / 'clip_texts.json'
+    if cfg_path.exists():
         try:
-            resp = client.chat(
-                model=model,
-                messages=[{'role': 'user', 'content': LLAVA_PROMPT, 'images': [tmp]}],
-                options={'temperature': 0.1},
-            )
-            text = resp.message.content.strip()
-            m = re.search(r'\{[\s\S]*?\}', text)
-            if m:
-                p = json.loads(m.group())
-                score = max(0, min(100, int(p.get('score', 0))))
-                desc  = str(p.get('desc', '')).strip()[:20]
-                return {**frame, 'score': score, 'description': desc}
-            # 没有 JSON，提取第一个数字
-            nums = re.findall(r'\b(\d{1,3})\b', text)
-            return {**frame, 'score': max(0, min(100, int(nums[0]))) if nums else 0, 'description': text[:20]}
-        except Exception as e:
-            if attempt < retries:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            return {**frame, 'score': 0, 'description': '分析失败', 'error': str(e)}
-    return {**frame, 'score': 0, 'description': ''}
+            cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+            low = cfg.get('low_texts', _DEFAULT_LOW_TEXTS)
+            high = cfg.get('high_texts', _DEFAULT_HIGH_TEXTS)
+            return low, high
+        except Exception:
+            pass
+    return _DEFAULT_LOW_TEXTS, _DEFAULT_HIGH_TEXTS
 
-def analyze_frames_llava(frames: List[Dict], model: str, concurrency: int) -> List[Dict]:
-    results = [None] * len(frames)
-    completed = 0
+CLIP_LOW_TEXTS, CLIP_HIGH_TEXTS = _load_clip_texts()
+
+# 全局懒加载 CLIP 模型（只初始化一次）
+_clip_model = None
+_clip_preprocess = None
+_clip_tokenizer = None
+
+def load_clip_model(model_name: str = 'ViT-B-32', pretrained: str = 'laion2b_s34b_b79k'):
+    """懒加载 CLIP 模型，CPU 即可运行"""
+    global _clip_model, _clip_preprocess, _clip_tokenizer
+    if _clip_model is None:
+        import open_clip
+        import torch
+        print(f'   加载 CLIP 模型: {model_name} ({pretrained})...')
+        _clip_model, _, _clip_preprocess = open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained)
+        _clip_tokenizer = open_clip.get_tokenizer(model_name)
+        _clip_model.eval()
+        # 判断设备
+        device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+        _clip_model = _clip_model.to(device)
+        print(f'   ✅ CLIP 已加载（设备: {device}）')
+    return _clip_model, _clip_preprocess, _clip_tokenizer
+
+def compute_clip_scores(frames: List[Dict], clip_model_name: str, clip_pretrained: str) -> List[Dict]:
+    """用 CLIP 对所有帧进行语义评分，批量处理速度快"""
+    import torch
+    import open_clip
+
+    model, preprocess, tokenizer = load_clip_model(clip_model_name, clip_pretrained)
+    device = next(model.parameters()).device
     total = len(frames)
-    print(f'\n🤖 LLaVA 语义评分 {total} 帧（并发: {concurrency}）...')
+    print(f'\n🤖 CLIP 语义评分 {total} 帧...')
 
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futures = {ex.submit(analyze_frame_llava, f, model): f for f in frames}
-        for fut in as_completed(futures):
-            r = fut.result()
-            results[r['index']] = r
-            completed += 1
-            print(f'\r   [{progress_bar(completed, total)}] {completed}/{total}  '
-                  f'{fmt_time(r["timestamp"])} → {r.get("score",0):3d}分  {r.get("description","")[:8]}',
-                  end='', flush=True)
+    # 预计算参考文本 embedding（一次性）
+    with torch.no_grad():
+        low_tokens = tokenizer(CLIP_LOW_TEXTS).to(device)
+        high_tokens = tokenizer(CLIP_HIGH_TEXTS).to(device)
+        low_emb = model.encode_text(low_tokens)   # (3, dim)
+        high_emb = model.encode_text(high_tokens)  # (3, dim)
+        low_emb = low_emb / low_emb.norm(dim=-1, keepdim=True)
+        high_emb = high_emb / high_emb.norm(dim=-1, keepdim=True)
+        # 取平均作为锚点
+        low_anchor = low_emb.mean(dim=0, keepdim=True)   # (1, dim)
+        high_anchor = high_emb.mean(dim=0, keepdim=True)  # (1, dim)
+        low_anchor = low_anchor / low_anchor.norm(dim=-1, keepdim=True)
+        high_anchor = high_anchor / high_anchor.norm(dim=-1, keepdim=True)
+
+    # 批量处理帧图像
+    BATCH_SIZE = 32
+    raw_scores = []
+
+    for batch_start in range(0, total, BATCH_SIZE):
+        batch_frames = frames[batch_start:batch_start + BATCH_SIZE]
+        images = []
+        for f in batch_frames:
+            img = Image.open(f['path']).convert('RGB')
+            images.append(preprocess(img))
+
+        image_tensor = torch.stack(images).to(device)
+
+        with torch.no_grad():
+            img_emb = model.encode_image(image_tensor)  # (batch, dim)
+            img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
+
+            # 与 high/low 锚点的余弦相似度
+            sim_high = (img_emb @ high_anchor.T).squeeze(-1)  # (batch,)
+            sim_low = (img_emb @ low_anchor.T).squeeze(-1)    # (batch,)
+            # 差值作为原始分数
+            diff = (sim_high - sim_low).cpu().tolist()
+            raw_scores.extend(diff)
+
+        done = min(batch_start + BATCH_SIZE, total)
+        print(f'\r   [{progress_bar(done, total)}] {done}/{total}', end='', flush=True)
+
     print()
-    failed = sum(1 for r in results if r and r.get('error'))
-    if failed:
-        print(f'   ⚠️  {failed} 帧失败')
-    print('   ✅ LLaVA 评分完成')
+
+    # 归一化到 0-100
+    min_s, max_s = min(raw_scores), max(raw_scores)
+    rng = max_s - min_s if max_s > min_s else 1
+    results = []
+    for frame, raw in zip(frames, raw_scores):
+        score = round((raw - min_s) / rng * 100)
+        results.append({**frame, 'score': score, 'description': f'CLIP:{score}'})
+
+    print(f'   ✅ CLIP 评分完成')
     return results
 
 # ──────────────────────────────────────────────────────────────
-# 3c. 仅对高光峰值帧补充 LLaVA 描述（motion 模式专用）
+# 3c. 仅对高光峰值帧补充 LLaVA 描述（--describe 时使用）
 # ──────────────────────────────────────────────────────────────
 
 def describe_peak_frames(highlights: List[Dict], analyses: List[Dict], model: str) -> List[Dict]:
@@ -313,21 +521,21 @@ def score_frames(frames: List[Dict], args: argparse.Namespace) -> List[Dict]:
     if args.mode == 'motion':
         return compute_motion_scores(frames)
 
-    elif args.mode == 'llava':
-        return analyze_frames_llava(frames, args.model, args.concurrency)
+    elif args.mode == 'clip':
+        return compute_clip_scores(frames, args.clip_model, args.clip_pretrained)
 
     else:  # hybrid
-        print('\n🔀 混合模式：运动量 × 0.6 + LLaVA × 0.4')
+        print('\n🔀 混合模式：运动量 × 0.6 + CLIP × 0.4')
         motion_results = compute_motion_scores(frames)
-        llava_results  = analyze_frames_llava(frames, args.model, args.concurrency)
+        clip_results   = compute_clip_scores(frames, args.clip_model, args.clip_pretrained)
 
         merged = []
-        for m, l in zip(motion_results, llava_results):
-            score = round(m['score'] * 0.6 + l['score'] * 0.4)
+        for m, c in zip(motion_results, clip_results):
+            score = round(m['score'] * 0.6 + c['score'] * 0.4)
             merged.append({**m, 'score': score,
                            'motion_score': m['score'],
-                           'llava_score':  l['score'],
-                           'description':  l.get('description', '')})
+                           'clip_score':   c['score'],
+                           'description':  c.get('description', '')})
         return merged
 
 # ──────────────────────────────────────────────────────────────
@@ -476,16 +684,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('url',                                       help='M3U8 视频地址')
     p.add_argument('-o', '--output-dir',                        help='输出目录')
     p.add_argument('--mode',          default='motion',
-                   choices=['motion', 'llava', 'hybrid'],       help='评分模式（默认 motion）')
+                   choices=['motion', 'clip', 'hybrid'],       help='评分模式（默认 motion）')
     p.add_argument('-i', '--interval',  type=float, default=3,  help='采样间隔秒（默认 3）')
     p.add_argument('--max-frames',      type=int,   default=150,help='最多采样帧数（默认 150）')
     p.add_argument('-d', '--clip-duration', type=float, default=20, help='每片段时长（默认 20）')
     p.add_argument('-n', '--count',     type=int,   default=5,  help='输出片段数（默认 5）')
     p.add_argument('-t', '--threshold', type=int,   default=60, help='高光阈值 0-100（默认 60）')
     p.add_argument('-m', '--merge',     action='store_true',    help='合并为 highlights.mp4')
-    p.add_argument('-c', '--concurrency', type=int, default=2,  help='LLaVA 并发数（默认 2）')
-    p.add_argument('--model',          default='llava',         help='Ollama 模型（默认 llava）')
-    p.add_argument('--describe',       action='store_true',     help='motion 模式下用 LLaVA 对高光帧补充描述')
+    p.add_argument('-c', '--concurrency', type=int, default=2,  help='LLaVA 描述并发数（默认 2）')
+    p.add_argument('--model',          default='llava',         help='LLaVA 模型，仅 --describe 用（默认 llava）')
+    p.add_argument('--clip-model',     default='ViT-B-32',      help='CLIP 模型（默认 ViT-B-32）')
+    p.add_argument('--clip-pretrained', default='laion2b_s34b_b79k', help='CLIP 预训练权重（默认 laion2b_s34b_b79k）')
+    p.add_argument('--describe',       action='store_true',     help='用 LLaVA 对高光帧补充描述（需要 Ollama）')
+    p.add_argument('--download-concurrency', type=int, default=16, help='M3U8 分片下载并发数（默认 16）')
     p.add_argument('--no-clip',        action='store_true',     help='仅分析，不剪辑')
     p.add_argument('-v', '--verbose',  action='store_true',     help='详细日志')
     return p.parse_args()
@@ -522,8 +733,16 @@ def main():
             interval = round(min_interval)
             print(f'   ℹ️  视频较长，采样间隔自动调整为 {interval}s')
 
+    # Step 1.5: 并发下载 M3U8（如果是 M3U8 链接）
+    video_src = args.url
+    local_video = download_m3u8(args.url, session_dir,
+                                concurrency=args.download_concurrency,
+                                verbose=args.verbose)
+    if local_video:
+        video_src = local_video
+
     # Step 2: 提帧
-    frames = extract_frames(args.url, frames_dir, interval, args.max_frames)
+    frames = extract_frames(video_src, frames_dir, interval, args.max_frames)
 
     # Step 3: 评分
     analyses = score_frames(frames, args)
@@ -548,8 +767,8 @@ def main():
         print('❌ 未找到高光片段，请尝试降低 --threshold')
         sys.exit(1)
 
-    # motion 模式下可选用 LLaVA 补充描述
-    if args.mode == 'motion' and args.describe:
+    # 可选用 LLaVA 补充描述
+    if args.describe:
         highlights = describe_peak_frames(highlights, analyses, args.model)
 
     print(f'   发现 {len(highlights)} 个高光片段：')
@@ -565,7 +784,7 @@ def main():
         print('✅ 分析完成（--no-clip 模式）')
         return
 
-    clips = extract_clips(args.url, highlights, session_dir, args.verbose)
+    clips = extract_clips(video_src, highlights, session_dir, args.verbose)
 
     # Step 6: 合并
     if args.merge and len(clips) > 1:

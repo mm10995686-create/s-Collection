@@ -1,0 +1,35 @@
+{
+  "_说明": "CLIP 模型文本提示词：模型计算视频帧与这些文本的相似度来判断是否为精彩片段（成人影片场景）",
+
+  "_low_texts说明": "低精彩度描述 — 与这些文本相似的帧会被判定为平淡片段",
+  "low_texts": [
+    "a person talking to camera in an interview",
+    "a person standing or sitting alone doing nothing",
+    "a static wide shot of an empty room",
+    "a title screen or credits text on black background",
+    "a person slowly undressing alone"
+  ],
+  "_low_texts注释": [
+    "对着镜头说话的采访片段",
+    "一个人站着或坐着无所事事",
+    "空房间的静态远景",
+    "黑底上的片头字幕或演职员表",
+    "一个人缓慢独自脱衣"
+  ],
+
+  "_high_texts说明": "高精彩度描述 — 与这些文本相似的帧会被判定为高光片段",
+  "high_texts": [
+    "two people in intense close physical interaction",
+    "vigorous dynamic body movement between people",
+    "a close-up of expressive faces showing strong emotion",
+    "fast rhythmic motion with multiple body parts",
+    "an intense passionate climax moment"
+  ],
+  "_high_texts注释": [
+    "两人激烈的近距离身体互动",
+    "人与人之间剧烈的动态身体运动",
+    "表情强烈、情绪饱满的面部特写",
+    "多个身体部位的快速有节奏运动",
+    "激情高潮的巅峰时刻"
+  ]
+}
