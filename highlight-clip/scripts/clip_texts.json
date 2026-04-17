@@ -8,11 +8,8 @@
     "a static wide shot of an empty room",
     "a title screen or credits text on black background",
     "a person slowly undressing alone",
-    "a slow or minimal movement",
-    "a calm or static scene",
-    "a no rapid or vigorous motion",
-    "a relaxed posture or inactivity",
-    "a faces with neutral or low-intensity expressions"
+    "a relaxed posture with neutral facial expression",
+    "slow minimal movement in a calm scene"
   ],
   "_low_texts注释": [
     "对着镜头说话的采访片段",
@@ -20,12 +17,8 @@
     "空房间的静态远景",
     "黑底上的片头字幕或演职员表",
     "一个人缓慢独自脱衣",
-    "没有激烈动作",
-    "动作慢或很少",
-    "场景平静、缺乏变化",
-    "没有快速或剧烈的肢体动作",
-    "姿势放松，没有明显活动",
-    "表情平淡或情绪不强烈"
+    "放松姿势、表情平淡",
+    "平静场景中缓慢微小的动作"
   ],
 
   "_high_texts说明": "高精彩度描述 — 与这些文本相似的帧会被判定为高光片段",
