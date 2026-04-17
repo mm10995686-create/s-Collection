@@ -305,20 +305,21 @@ def download_m3u8(url: str, session_dir: Path, concurrency: int = 16,
         shutil.rmtree(seg_dir, ignore_errors=True)
         return None
 
-    # 用 ffmpeg concat demuxer 正确合并分片（修复时间戳和容器格式）
+    # 先字节拼接为 .ts（TS 格式天然支持拼接），再 ffmpeg remux 为 mp4
     output_path = session_dir / 'video.mp4'
+    merged_ts = seg_dir / 'merged.ts'
     print(f'   🔗 合并分片...', end='', flush=True)
     seg_files = sorted(seg_dir.glob('seg_*.ts'))
-    concat_list = seg_dir / 'concat.txt'
-    concat_list.write_text('\n'.join(f"file '{sf}'" for sf in seg_files))
+    with open(merged_ts, 'wb') as out:
+        for sf in seg_files:
+            out.write(sf.read_bytes())
 
     try:
         run_cmd([
-            'ffmpeg', '-f', 'concat', '-safe', '0',
-            '-i', str(concat_list),
+            'ffmpeg', '-y', '-i', str(merged_ts),
             '-c', 'copy',
             '-movflags', '+faststart',
-            str(output_path), '-y'
+            str(output_path)
         ], timeout=300)
         print(f' ✅ {output_path.stat().st_size / 1024 / 1024:.1f} MB')
     except Exception as e:

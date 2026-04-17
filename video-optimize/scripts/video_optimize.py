@@ -278,23 +278,22 @@ def download_m3u8_fast(url: str, output_path: Path, concurrency: int = 16) -> bo
         shutil.rmtree(seg_dir, ignore_errors=True)
         return False
 
-    # 用 ffmpeg concat demuxer 正确合并分片
+    # 先字节拼接为 .ts，再 ffmpeg remux（TS 天然支持拼接，concat demuxer 对 TS 兼容性差）
     log.info("合并分片...")
     seg_files = sorted(seg_dir.glob("seg_*.ts"))
-    concat_list = seg_dir / "concat.txt"
-    concat_list.write_text("\n".join(f"file '{sf}'" for sf in seg_files))
+    merged_ts = seg_dir / "merged.ts"
+    with open(merged_ts, "wb") as out:
+        for sf in seg_files:
+            out.write(sf.read_bytes())
 
-    concat_cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(concat_list),
+    remux_cmd = [
+        "ffmpeg", "-y", "-i", str(merged_ts),
         "-c", "copy", str(output_path),
     ]
-    proc = subprocess.run(concat_cmd, capture_output=True, text=True)
+    proc = subprocess.run(remux_cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        log.error(f"ffmpeg 合并失败，回退到字节拼接")
-        with open(output_path, "wb") as out:
-            for sf in seg_files:
-                out.write(sf.read_bytes())
+        log.error("ffmpeg remux 失败，直接使用拼接的 ts")
+        shutil.move(str(merged_ts), str(output_path))
 
     shutil.rmtree(seg_dir, ignore_errors=True)
 
