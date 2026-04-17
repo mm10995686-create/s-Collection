@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 视频编码优化脚本
 H.264 + .ts → H.265 + fMP4/CMAF
