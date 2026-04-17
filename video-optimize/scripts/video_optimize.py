@@ -107,9 +107,17 @@ def _fetch_text(url: str, timeout: int = 15) -> str:
         return resp.read().decode("utf-8", errors="replace")
 
 
-def parse_m3u8(url: str) -> tuple[list[str], float]:
+def _fetch_binary(url: str, timeout: int = 15) -> bytes:
+    """下载二进制内容"""
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def parse_m3u8(url: str) -> tuple[list[str], float, dict | None]:
     """
-    解析 M3U8 播放列表，返回 (分片 URL 列表, 总时长秒数)。
+    解析 M3U8 播放列表，返回 (分片 URL 列表, 总时长秒数, 加密信息)。
+    加密信息: None 表示未加密，否则 {'method': str, 'key_url': str, 'iv': str|None}
     自动处理 master playlist → 选最高带宽的 variant。
     """
     text = _fetch_text(url)
@@ -132,6 +140,20 @@ def parse_m3u8(url: str) -> tuple[list[str], float]:
             log.info(f"Master playlist → 选择最高画质（带宽: {best_bw}）")
             return parse_m3u8(variant_url)
 
+    # 检测加密：提取 #EXT-X-KEY 信息
+    key_info = None
+    for l in lines:
+        if "#EXT-X-KEY" in l and "METHOD=NONE" not in l:
+            method_m = re.search(r"METHOD=([^,\s]+)", l)
+            uri_m = re.search(r'URI="([^"]+)"', l)
+            iv_m = re.search(r"IV=0x([0-9a-fA-F]+)", l, re.IGNORECASE)
+            if method_m and uri_m:
+                key_info = {
+                    "method": method_m.group(1),
+                    "key_url": urljoin(url, uri_m.group(1)),
+                    "iv": iv_m.group(1) if iv_m else None,
+                }
+
     # media playlist：解析分片
     segments = []
     total_duration = 0.0
@@ -146,17 +168,39 @@ def parse_m3u8(url: str) -> tuple[list[str], float]:
                     segments.append(seg_url)
                     break
 
-    return segments, total_duration
+    return segments, total_duration, key_info
+
+
+def _decrypt_aes128(data: bytes, key: bytes, iv: bytes) -> bytes:
+    """AES-128-CBC 解密，优先用 cryptography 库，回退到 openssl 命令行"""
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+        decrypted = decryptor.update(data) + decryptor.finalize()
+        return decrypted[:-decrypted[-1]]
+    except ImportError:
+        pass
+
+    proc = subprocess.run(
+        ["openssl", "enc", "-aes-128-cbc", "-d", "-K", key.hex(), "-iv", iv.hex()],
+        input=data, capture_output=True
+    )
+    if proc.returncode == 0:
+        return proc.stdout
+    raise RuntimeError("AES 解密失败，建议安装: pip3 install cryptography")
 
 
 def _download_segment(args_tuple: tuple) -> tuple[int, bool, str]:
-    """下载单个分片，失败重试 3 次"""
-    idx, seg_url, output_path, retries = args_tuple
+    """下载单个分片（如有加密则解密），失败重试 3 次"""
+    idx, seg_url, output_path, retries, key_bytes, iv_hex = args_tuple
     for attempt in range(retries + 1):
         try:
             req = Request(seg_url, headers={"User-Agent": "Mozilla/5.0"})
             with urlopen(req, timeout=30) as resp:
                 data = resp.read()
+            if key_bytes:
+                iv = bytes.fromhex(iv_hex)
+                data = _decrypt_aes128(data, key_bytes, iv)
             Path(output_path).write_bytes(data)
             return idx, True, ""
         except Exception as e:
@@ -173,12 +217,12 @@ def _progress_bar(done: int, total: int, width: int = 20) -> str:
 
 def download_m3u8_fast(url: str, output_path: Path, concurrency: int = 16) -> bool:
     """
-    并发下载 M3U8 所有分片，合并为本地 .ts 文件。
+    并发下载 M3U8 所有分片（加密的自动解密），合并为本地文件。
     返回是否成功。
     """
     log.info(f"解析 M3U8 播放列表...")
     try:
-        segments, duration = parse_m3u8(url)
+        segments, duration, key_info = parse_m3u8(url)
     except Exception as e:
         log.error(f"M3U8 解析失败: {e}")
         return False
@@ -187,9 +231,23 @@ def download_m3u8_fast(url: str, output_path: Path, concurrency: int = 16) -> bo
         log.error("未解析到分片")
         return False
 
+    # 处理加密：下载密钥
+    key_bytes = None
+    if key_info and key_info["method"] == "AES-128":
+        log.info("检测到 AES-128 加密，下载密钥...")
+        try:
+            key_bytes = _fetch_binary(key_info["key_url"])
+        except Exception as e:
+            log.error(f"密钥下载失败: {e}")
+            return False
+    elif key_info:
+        log.error(f"不支持的加密方式: {key_info['method']}")
+        return False
+
     total = len(segments)
     dur_str = time.strftime("%H:%M:%S", time.gmtime(duration)) if duration else "?"
-    log.info(f"共 {total} 个分片（约 {dur_str}），{concurrency} 并发下载...")
+    enc_label = "（解密模式）" if key_bytes else ""
+    log.info(f"共 {total} 个分片（约 {dur_str}），{concurrency} 并发下载{enc_label}...")
 
     # 临时目录
     seg_dir = output_path.parent / "_segments"
@@ -198,7 +256,8 @@ def download_m3u8_fast(url: str, output_path: Path, concurrency: int = 16) -> bo
     tasks = []
     for i, seg_url in enumerate(segments):
         seg_path = str(seg_dir / f"seg_{i:05d}.ts")
-        tasks.append((i, seg_url, seg_path, 3))
+        iv_hex = key_info["iv"] if key_bytes and key_info.get("iv") else format(i, "032x") if key_bytes else None
+        tasks.append((i, seg_url, seg_path, 3, key_bytes, iv_hex))
 
     completed = 0
     failed = 0

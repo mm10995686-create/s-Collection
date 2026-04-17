@@ -121,9 +121,16 @@ def _fetch_text(url: str, timeout: int = 15) -> str:
     with urlopen(req, timeout=timeout) as resp:
         return resp.read().decode('utf-8', errors='replace')
 
-def parse_m3u8(url: str) -> Tuple[List[str], float]:
+def _fetch_binary(url: str, timeout: int = 15) -> bytes:
+    """下载二进制内容"""
+    req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+def parse_m3u8(url: str) -> Tuple[List[str], float, Optional[Dict]]:
     """
-    解析 M3U8 播放列表，返回 (分片 URL 列表, 总时长秒数)。
+    解析 M3U8 播放列表，返回 (分片 URL 列表, 总时长秒数, 加密信息)。
+    加密信息: None 表示未加密，否则 {'method': str, 'key_url': str, 'iv': str|None}
     自动处理 master playlist → 选最高带宽的 variant。
     """
     text = _fetch_text(url)
@@ -135,10 +142,8 @@ def parse_m3u8(url: str) -> Tuple[List[str], float]:
         best_uri = None
         for i, line in enumerate(lines):
             if '#EXT-X-STREAM-INF' in line:
-                # 提取 BANDWIDTH
                 m = re.search(r'BANDWIDTH=(\d+)', line)
                 bw = int(m.group(1)) if m else 0
-                # 下一行是 URI
                 if i + 1 < len(lines) and not lines[i + 1].startswith('#'):
                     if bw > best_bw:
                         best_bw = bw
@@ -148,32 +153,68 @@ def parse_m3u8(url: str) -> Tuple[List[str], float]:
             print(f'   📡 Master playlist → 选择最高画质（带宽: {best_bw}）')
             return parse_m3u8(variant_url)
 
+    # 检测加密：提取 #EXT-X-KEY 信息
+    key_info = None
+    for l in lines:
+        if '#EXT-X-KEY' in l and 'METHOD=NONE' not in l:
+            method_m = re.search(r'METHOD=([^,\s]+)', l)
+            uri_m = re.search(r'URI="([^"]+)"', l)
+            iv_m = re.search(r'IV=0x([0-9a-fA-F]+)', l, re.IGNORECASE)
+            if method_m and uri_m:
+                key_info = {
+                    'method': method_m.group(1),
+                    'key_url': urljoin(url, uri_m.group(1)),
+                    'iv': iv_m.group(1) if iv_m else None,
+                }
+
     # media playlist：解析分片
     segments = []
     total_duration = 0.0
     for i, line in enumerate(lines):
         if line.startswith('#EXTINF:'):
-            # 提取时长
             m = re.search(r'#EXTINF:([\d.]+)', line)
             if m:
                 total_duration += float(m.group(1))
-            # 下一个非注释行是分片 URL
             for j in range(i + 1, len(lines)):
                 if lines[j].strip() and not lines[j].startswith('#'):
                     seg_url = urljoin(url, lines[j].strip())
                     segments.append(seg_url)
                     break
 
-    return segments, total_duration
+    return segments, total_duration, key_info
+
+def _decrypt_aes128(data: bytes, key: bytes, iv: bytes) -> bytes:
+    """AES-128-CBC 解密，优先用 cryptography 库，回退到 openssl 命令行"""
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+        decrypted = decryptor.update(data) + decryptor.finalize()
+        # PKCS7 去填充
+        return decrypted[:-decrypted[-1]]
+    except ImportError:
+        pass
+
+    # 回退到 openssl
+    proc = subprocess.run(
+        ['openssl', 'enc', '-aes-128-cbc', '-d', '-K', key.hex(), '-iv', iv.hex()],
+        input=data, capture_output=True
+    )
+    if proc.returncode == 0:
+        return proc.stdout
+    raise RuntimeError('AES 解密失败，建议安装: pip3 install cryptography')
 
 def _download_segment(args_tuple: tuple) -> Tuple[int, bool, str]:
-    """下载单个分片，失败重试 3 次"""
-    idx, seg_url, output_path, retries = args_tuple
+    """下载单个分片（如有加密则解密），失败重试 3 次"""
+    idx, seg_url, output_path, retries, key_bytes, iv_hex = args_tuple
     for attempt in range(retries + 1):
         try:
             req = Request(seg_url, headers={'User-Agent': 'Mozilla/5.0'})
             with urlopen(req, timeout=30) as resp:
                 data = resp.read()
+            # 解密
+            if key_bytes:
+                iv = bytes.fromhex(iv_hex)
+                data = _decrypt_aes128(data, key_bytes, iv)
             Path(output_path).write_bytes(data)
             return idx, True, ''
         except Exception as e:
@@ -185,7 +226,7 @@ def _download_segment(args_tuple: tuple) -> Tuple[int, bool, str]:
 def download_m3u8(url: str, session_dir: Path, concurrency: int = 16,
                   verbose: bool = False) -> Optional[str]:
     """
-    并发下载 M3U8 分片，合并为本地 video.ts。
+    并发下载 M3U8 分片（加密的自动解密），合并为本地 video.mp4。
     如果 URL 不是 M3U8 返回 None（由调用方继续用原始 URL）。
     """
     # 判断是否为 M3U8
@@ -203,7 +244,7 @@ def download_m3u8(url: str, session_dir: Path, concurrency: int = 16,
 
     print(f'\n📥 解析 M3U8 播放列表...')
     try:
-        segments, m3u8_duration = parse_m3u8(url)
+        segments, m3u8_duration, key_info = parse_m3u8(url)
     except Exception as e:
         print(f'   ⚠️  M3U8 解析失败（{e}），回退到 ffmpeg 直接读取')
         return None
@@ -212,8 +253,23 @@ def download_m3u8(url: str, session_dir: Path, concurrency: int = 16,
         print(f'   ⚠️  未解析到分片，回退到 ffmpeg 直接读取')
         return None
 
+    # 处理加密：下载密钥
+    key_bytes = None
+    if key_info and key_info['method'] == 'AES-128':
+        print(f'   🔐 检测到 AES-128 加密，下载密钥...')
+        try:
+            key_bytes = _fetch_binary(key_info['key_url'])
+        except Exception as e:
+            print(f'   ⚠️  密钥下载失败（{e}），回退到 ffmpeg 直接读取')
+            return None
+    elif key_info:
+        # 不支持的加密方式（如 SAMPLE-AES），回退到 ffmpeg
+        print(f'   ⚠️  不支持的加密方式（{key_info["method"]}），回退到 ffmpeg 直接读取')
+        return None
+
     total = len(segments)
-    print(f'   共 {total} 个分片（约 {fmt_time(m3u8_duration)}），并发 {concurrency} 下载...')
+    enc_label = '（已解密）' if key_bytes else ''
+    print(f'   共 {total} 个分片（约 {fmt_time(m3u8_duration)}），并发 {concurrency} 下载{enc_label}...')
 
     # 临时目录存放分片
     seg_dir = session_dir / '_segments'
@@ -223,9 +279,11 @@ def download_m3u8(url: str, session_dir: Path, concurrency: int = 16,
     tasks = []
     for i, seg_url in enumerate(segments):
         seg_path = str(seg_dir / f'seg_{i:05d}.ts')
-        tasks.append((i, seg_url, seg_path, 3))
+        # IV：优先用 m3u8 里的，否则用分片序号
+        iv_hex = key_info['iv'] if key_bytes and key_info.get('iv') else format(i, '032x') if key_bytes else None
+        tasks.append((i, seg_url, seg_path, 3, key_bytes, iv_hex))
 
-    # 并发下载
+    # 并发下载（+解密）
     completed = 0
     failed = 0
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
