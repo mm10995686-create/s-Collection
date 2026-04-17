@@ -52,7 +52,7 @@ python3 scripts/highlight_clip.py <m3u8_url> [选项]
 
 采样
   -i, --interval <秒>   帧采样间隔（默认 3，长视频自动加大）
-  --max-frames <数>     最多采样帧数（默认 150）
+  --max-frames <数>     最多采样帧数（默认根据时长自动计算：每分钟约10帧，100~600）
 
 高光识别
   -t, --threshold <0-100>  分数阈值（默认 60，自动自适应）
@@ -112,10 +112,10 @@ M3U8 URL
 
 | 阶段 | 耗时 |
 |------|------|
-| M3U8 并发下载（16 并发） | 1-2 分钟 |
-| 提帧（149 帧，本地文件） | < 1 分钟 |
+| M3U8 并发下载+解密（16 并发） | 1-2 分钟 |
+| 提帧（~170 帧，本地文件） | < 1 分钟 |
 | motion 运动量计算 | < 30 秒 |
-| CLIP 语义评分（149 帧） | < 1 分钟（CPU） |
+| CLIP 语义评分 | < 1 分钟（CPU） |
 | LLaVA 描述 5 帧（--describe） | 约 1 分钟 |
 | 剪辑 5 个片段（本地文件） | < 1 分钟 |
 
@@ -140,7 +140,9 @@ M3U8 URL
     "a person standing or sitting alone doing nothing",
     "a static wide shot of an empty room",
     "a title screen or credits text on black background",
-    "a person slowly undressing alone"
+    "a person slowly undressing alone",
+    "a relaxed posture with neutral facial expression",
+    "slow minimal movement in a calm scene"
   ],
   "high_texts": [
     "two people in intense close physical interaction",
@@ -250,7 +252,7 @@ ollama list         # 查看已下载模型
 
 **Q: 提帧太慢？**
 - 加大采样间隔：`-i 10`
-- 减少帧数：`--max-frames 80`
+- 手动限制帧数：`--max-frames 80`
 
 **Q: 片段选得不准？**
 - 试试 `--mode clip` 或 `--mode hybrid`

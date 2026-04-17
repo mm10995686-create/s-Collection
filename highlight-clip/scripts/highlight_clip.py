@@ -757,7 +757,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--mode',          default='motion',
                    choices=['motion', 'clip', 'hybrid'],       help='评分模式（默认 motion）')
     p.add_argument('-i', '--interval',  type=float, default=3,  help='采样间隔秒（默认 3）')
-    p.add_argument('--max-frames',      type=int,   default=150,help='最多采样帧数（默认 150）')
+    p.add_argument('--max-frames',      type=int,   default=0,  help='最多采样帧数（默认根据时长自动计算）')
     p.add_argument('-d', '--clip-duration', type=float, default=20, help='每片段时长（默认 20）')
     p.add_argument('-n', '--count',     type=int,   default=5,  help='输出片段数（默认 5）')
     p.add_argument('-t', '--threshold', type=int,   default=60, help='高光阈值 0-100（默认 60）')
@@ -798,11 +798,22 @@ def main():
     # Step 1: 时长
     duration = get_video_duration(args.url)
     interval = args.interval
+
+    # 动态计算 max_frames：每分钟约 10 帧，下限 100，上限 600
+    if args.max_frames > 0:
+        max_frames = args.max_frames
+    elif duration > 0:
+        max_frames = max(100, min(600, int(duration / 60 * 10)))
+    else:
+        max_frames = 150
+
     if duration > 0:
-        min_interval = duration / args.max_frames
+        min_interval = duration / max_frames
         if min_interval > interval:
             interval = round(min_interval)
             print(f'   ℹ️  视频较长，采样间隔自动调整为 {interval}s')
+
+    print(f'   ℹ️  采样帧数上限: {max_frames}，间隔: {interval}s')
 
     # Step 1.5: 并发下载 M3U8（如果是 M3U8 链接）
     video_src = args.url
@@ -813,7 +824,7 @@ def main():
         video_src = local_video
 
     # Step 2: 提帧
-    frames = extract_frames(video_src, frames_dir, interval, args.max_frames)
+    frames = extract_frames(video_src, frames_dir, interval, max_frames)
 
     # Step 3: 评分
     analyses = score_frames(frames, args)
