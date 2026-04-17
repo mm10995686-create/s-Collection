@@ -247,14 +247,26 @@ def download_m3u8(url: str, session_dir: Path, concurrency: int = 16,
         shutil.rmtree(seg_dir, ignore_errors=True)
         return None
 
-    # 按序号合并分片为 video.ts
-    output_path = session_dir / 'video.ts'
+    # 用 ffmpeg concat demuxer 正确合并分片（修复时间戳和容器格式）
+    output_path = session_dir / 'video.mp4'
     print(f'   🔗 合并分片...', end='', flush=True)
     seg_files = sorted(seg_dir.glob('seg_*.ts'))
-    with open(output_path, 'wb') as out:
-        for sf in seg_files:
-            out.write(sf.read_bytes())
-    print(f' ✅ {output_path.stat().st_size / 1024 / 1024:.1f} MB')
+    concat_list = seg_dir / 'concat.txt'
+    concat_list.write_text('\n'.join(f"file '{sf}'" for sf in seg_files))
+
+    try:
+        run_cmd([
+            'ffmpeg', '-f', 'concat', '-safe', '0',
+            '-i', str(concat_list),
+            '-c', 'copy',
+            '-movflags', '+faststart',
+            str(output_path), '-y'
+        ], timeout=300)
+        print(f' ✅ {output_path.stat().st_size / 1024 / 1024:.1f} MB')
+    except Exception as e:
+        print(f' ❌ ffmpeg 合并失败：{e}')
+        shutil.rmtree(seg_dir, ignore_errors=True)
+        return None
 
     # 清理临时分片
     shutil.rmtree(seg_dir, ignore_errors=True)

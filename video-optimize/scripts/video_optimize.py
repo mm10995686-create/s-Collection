@@ -219,12 +219,23 @@ def download_m3u8_fast(url: str, output_path: Path, concurrency: int = 16) -> bo
         shutil.rmtree(seg_dir, ignore_errors=True)
         return False
 
-    # 按序号合并
+    # 用 ffmpeg concat demuxer 正确合并分片
     log.info("合并分片...")
     seg_files = sorted(seg_dir.glob("seg_*.ts"))
-    with open(output_path, "wb") as out:
-        for sf in seg_files:
-            out.write(sf.read_bytes())
+    concat_list = seg_dir / "concat.txt"
+    concat_list.write_text("\n".join(f"file '{sf}'" for sf in seg_files))
+
+    concat_cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", str(concat_list),
+        "-c", "copy", str(output_path),
+    ]
+    proc = subprocess.run(concat_cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        log.error(f"ffmpeg 合并失败，回退到字节拼接")
+        with open(output_path, "wb") as out:
+            for sf in seg_files:
+                out.write(sf.read_bytes())
 
     shutil.rmtree(seg_dir, ignore_errors=True)
 

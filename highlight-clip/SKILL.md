@@ -85,7 +85,7 @@ LLaVA 模型（仅 --describe 用）
 ```
 M3U8 URL
   ├─ ffprobe 获取时长
-  ├─ 并发下载 M3U8 分片 → 本地 video.ts（自动检测，非 M3U8 跳过）
+  ├─ 并发下载 M3U8 分片 → ffmpeg 合并为本地 video.mp4（自动检测，非 M3U8 跳过）
   ├─ ffmpeg 提取帧（从本地文件，scale=1280, fps=1/interval）
   ├─ 评分（motion / CLIP / hybrid）
   ├─ [可选] LLaVA 对 Top N 峰值帧补充描述（--describe）
@@ -98,7 +98,7 @@ M3U8 URL
 
 ```
 ~/.openclaw/data/highlight-clip/<session-id>/
-├── video.ts          M3U8 下载的本地视频（M3U8 链接时生成）
+├── video.mp4         M3U8 下载合并的本地视频（M3U8 链接时生成）
 ├── frames/           提取的视频帧（JPG）
 ├── analysis.json     每帧评分结果
 ├── highlights.json   高光片段信息
@@ -135,20 +135,24 @@ M3U8 URL
 ```json
 {
   "low_texts": [
-    "a still static frame with no movement",
-    "a calm quiet scene with nothing happening",
-    "a boring static image"
+    "a person talking to camera in an interview",
+    "a person standing or sitting alone doing nothing",
+    "a static wide shot of an empty room",
+    "a title screen or credits text on black background",
+    "a person slowly undressing alone"
   ],
   "high_texts": [
-    "an exciting intense moment with strong action",
-    "a dramatic climax with vigorous movement",
-    "a thrilling highlight with peak intensity"
+    "two people in intense close physical interaction",
+    "vigorous dynamic body movement between people",
+    "a close-up of expressive faces showing strong emotion",
+    "fast rhythmic motion with multiple body parts",
+    "an intense passionate climax moment"
   ]
 }
 ```
 
-- `low_texts`：低分锚点，描述"无聊/静止"的画面
-- `high_texts`：高分锚点，描述"精彩/激烈"的画面
+- `low_texts`：低分锚点，描述平淡/过渡画面（采访、空镜、字幕等）
+- `high_texts`：高分锚点，描述精彩/高光画面（激烈互动、动态运动、表情特写等）
 - CLIP 计算每帧与两组文本的相似度差值，归一化为 0-100 分
 - 根据具体业务调整文本可以提升评分精度
 | + LLaVA 描述 | 加 `--describe` | 不影响 | +1min | 需要 Ollama | 需要了解片段内容 |
