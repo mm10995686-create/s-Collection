@@ -66,6 +66,7 @@ python3 scripts/highlight_clip.py <m3u8_url> [选项]
 
 下载
   --download-concurrency <数>  M3U8 分片并发下载数（默认 16）
+  注：自动检测 AES-128 加密，并发下载后自动解密（需要 cryptography 或 openssl）
 
 CLIP 模型
   --clip-model <名>        CLIP 模型架构（默认 ViT-B-32）
@@ -85,7 +86,7 @@ LLaVA 模型（仅 --describe 用）
 ```
 M3U8 URL
   ├─ ffprobe 获取时长
-  ├─ 并发下载 M3U8 分片 → ffmpeg 合并为本地 video.mp4（自动检测，非 M3U8 跳过）
+  ├─ 并发下载 M3U8 分片（加密的自动解密）→ ffmpeg 合并为本地 video.mp4
   ├─ ffmpeg 提取帧（从本地文件，scale=1280, fps=1/interval）
   ├─ 评分（motion / CLIP / hybrid）
   ├─ [可选] LLaVA 对 Top N 峰值帧补充描述（--describe）
@@ -155,6 +156,7 @@ M3U8 URL
 - `high_texts`：高分锚点，描述精彩/高光画面（激烈互动、动态运动、表情特写等）
 - CLIP 计算每帧与两组文本的相似度差值，归一化为 0-100 分
 - 根据具体业务调整文本可以提升评分精度
+
 | + LLaVA 描述 | 加 `--describe` | 不影响 | +1min | 需要 Ollama | 需要了解片段内容 |
 
 ---
